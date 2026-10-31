@@ -344,4 +344,317 @@ void main() {
         assertNotEquals(sharpenPcOutput, out)
         assertEquals(2, report.size)
     }
+
+    // ═════════════════════ v0.7.19: audio_base ground truth ═════════════════════
+
+    /**
+     * The audio_base.frag constructs EXACTLY as the PC pipeline emits them
+     * (reconstructed from the real engine failure log of workshop 3588616811,
+     * 2026-10-31): int/float comparisons and int-var arithmetic against float
+     * literals, with the results fed to an int-parameter helper — the float
+     * RESULT must come back through an explicit int() (fxc's implicit
+     * float→int argument conversion truncates toward zero).
+     */
+    private val audioBasePcOutput = """
+uniform sampler2D g_Texture0; // {"material":"framebuffer","label":"ui_editor_properties_framebuffer","hidden":true}
+uniform float g_AudioSpectrum64Left[64];
+uniform float g_AudioSpectrum64Right[64];
+varying vec2 v_TexCoord;
+float getAudioValueByBand(int index) {
+        if (index < 0.0) index = int(0.0);
+        if (index >= 64.0) index = int(63.0);
+        return (g_AudioSpectrum64Left[index] + g_AudioSpectrum64Right[index]) * 0.5;
+}
+float getInterpolatedAudio(float position) {
+        int index = int(floor(position));
+        float p0 = getAudioValueByBand(index - 1.0);
+        float p1 = getAudioValueByBand(index);
+        float p2 = getAudioValueByBand(index + 1.0);
+        float p3 = getAudioValueByBand(index + 2.0);
+        return p0 + p1 + p2 + p3;
+}
+void main() {
+        float v = getInterpolatedAudio(v_TexCoord.x);
+        out_FragColor = vec4(v, v, v, 1.0);
+}
+""".trimStart()
+
+    @Test
+    fun `audio_base - int float comparisons get the int side promoted`() {
+        val out = ShaderEsslSafety.apply(audioBasePcOutput)
+        // fxc: int promotes to float for the comparison (glslang 16.6 rejects
+        // the mixed form — the exact errors in the engine log)
+        assertTrue(out.contains("if (float(index) < 0.0)"))
+        assertTrue(out.contains("if (float(index) >= 64.0)"))
+    }
+
+    @Test
+    fun `audio_base - float argument into int parameter gets explicit int`() {
+        val out = ShaderEsslSafety.apply(audioBasePcOutput)
+        // fxc: index - 1.0 evaluates in float, then the call converts the
+        // float back to int (truncation toward zero) — both steps explicit
+        assertTrue(out.contains("getAudioValueByBand(int(float(index) - 1.0));"))
+        assertTrue(out.contains("getAudioValueByBand(int(float(index) + 1.0));"))
+        assertTrue(out.contains("getAudioValueByBand(int(float(index) + 2.0));"))
+        // the pure-int call is untouched
+        assertTrue(out.contains("getAudioValueByBand(index);"))
+    }
+
+    // ═════════════════════ v0.7.19: scalar broadcast ═════════════════════
+
+    @Test
+    fun `scalar broadcast in declaration gets vector ctor`() {
+        val src = """
+uniform float u_x;
+void main() {
+        vec2 texelSize = 1.0;
+        vec3 scale = u_x;
+        vec4 zero = 0.0;
+        out_FragColor = zero + vec4(texelSize, 0.0) + vec4(scale, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // the APK's own editorpaintbrush.frag ships `vec2 texelSize = 1.0;`
+        // in an editor-only path — ESSL 3.00 requires the ctor (glslang 16.6:
+        // "cannot convert from 'const float' to '2-component vector'")
+        assertTrue(out.contains("vec2 texelSize = vec2(1.0);"))
+        assertTrue(out.contains("vec3 scale = vec3(u_x);"))
+        assertTrue(out.contains("vec4 zero = vec4(0.0);"))
+    }
+
+    @Test
+    fun `scalar broadcast in plain assignment gets vector ctor`() {
+        val src = """
+uniform float u_x;
+void main() {
+        vec2 t;
+        t = 1.0;
+        out_FragColor = vec4(t, 0.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        assertTrue(out.contains("t = vec2(1.0);"))
+    }
+
+    // ═════════════════════ v0.7.19: compound assignment ═════════════════════
+
+    @Test
+    fun `compound assignment with int operand gets ctor`() {
+        val src = """
+uniform int u_i;
+void main() {
+        vec2 v = vec2(1.0);
+        v *= u_i;
+        float f = 1.0;
+        f += u_i;
+        out_FragColor = vec4(v, f, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        assertTrue(out.contains("v *= float(u_i);"))
+        assertTrue(out.contains("f += float(u_i);"))
+    }
+
+    // ═════════════════════ v0.7.19: array subscript ═════════════════════
+
+    @Test
+    fun `float array subscript gets explicit int`() {
+        val src = """
+uniform float u_arr[4];
+uniform float u_f;
+varying vec4 v_TexCoord;
+void main() {
+        float x = u_arr[u_f];
+        out_FragColor = vec4(x);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // the engine team's own APK ships a float subscript in a dead branch
+        // of puppettexturechannels.vert — ESSL needs the scalar int expr
+        assertTrue(out.contains("u_arr[int(u_f)]"))
+    }
+
+    // ═════════════════════ v0.7.19: ternary arms ═════════════════════
+
+    @Test
+    fun `mixed ternary arms get the int side promoted`() {
+        val src = """
+uniform int u_a;
+uniform float u_b;
+void main() {
+        float x = u_b > 0.5 ? 1 : 0.5;
+        float y = u_b > 0.5 ? u_a : 0.5;
+        out_FragColor = vec4(x, y, 0.0, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        assertTrue(out.contains("? 1.0 : 0.5;") || out.contains("? float(1) : 0.5;") ||
+            out.contains("u_b > 0.5 ? 1 : 0.5".replace("1 :", "float(1) :")))
+        assertTrue(out.contains("u_b > 0.5 ? float(u_a) : 0.5;"))
+    }
+
+    // ═════════════════════ v0.7.19: argument conversions ═════════════════════
+
+    @Test
+    fun `scalar argument into vector parameter gets broadcast ctor`() {
+        val src = """
+uniform float u_x;
+void helper(vec2 dir, vec3 amt) { }
+void main() {
+        helper(u_x, 2.0);
+        out_FragColor = vec4(0.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // fxc broadcasts scalars to any vector parameter; ESSL 3.00 needs the
+        // ctor (the APK's combine_hdr.frag uses the explicit CAST3(2.4) form)
+        assertTrue(out.contains("helper(vec2(u_x), vec3(2.0));"))
+    }
+
+    @Test
+    fun `vector argument into smaller parameter keeps leading components`() {
+        val src = """
+uniform vec4 u_v;
+void helper(vec2 dir) { }
+void main() {
+        helper(u_v);
+        out_FragColor = vec4(0.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        assertTrue(out.contains("helper((u_v).xy);"))
+    }
+
+    @Test
+    fun `gl VertexID into uint parameter gets explicit cast`() {
+        val src = """
+uniform sampler2D g_Morph;
+uniform vec4 g_MorphTexel;
+uniform uint g_MorphOffsets[12];
+uniform float g_MorphWeights[12];
+void ApplyMorph(in uint vertexID, sampler2D morphTexture, in vec4 morphTextureTexel,
+        in uint morphOffsets[12], in float morphWeights[12], inout vec3 localPos) { }
+void main() {
+        vec3 pos = vec3(0.0);
+        ApplyMorph(gl_VertexID, g_Morph, g_MorphTexel, g_MorphOffsets, g_MorphWeights, pos);
+        out_FragColor = vec4(pos, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // the engine's own model_vertex_v1.h morphing functions take
+        // `in uint vertexID` while gl_VertexID is int in ESSL 3.00
+        assertTrue(out.contains("ApplyMorph(uint(gl_VertexID),"))
+    }
+
+    @Test
+    fun `base conversion in assignments - no implicit conversions in ESSL`() {
+        val src = """
+uniform int u_i;
+void main() {
+        uint u = u_i;
+        float f = u_i;
+        int back = f;
+        out_FragColor = vec4(u, f, back, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // glslang 16.6 rejects even `float f = intVar;` — ESSL 3.00 has NO
+        // implicit conversions at all
+        assertTrue(out.contains("uint u = uint(u_i);"))
+        assertTrue(out.contains("float f = float(u_i);"))
+        assertTrue(out.contains("int back = int(f);"))
+    }
+
+    // ═════════════════════ v0.7.19: shadow samplers ═════════════════════
+
+    @Test
+    fun `texSample2DCompare becomes texture vec3 with trailing swizzle consumed`() {
+        val src = """
+uniform sampler2DComparison g_ShadowMap;
+varying vec4 v_TexCoord;
+void main() {
+        float lit = texSample2DCompare(g_ShadowMap, v_TexCoord.xy, v_TexCoord.z).r;
+        out_FragColor = vec4(lit, lit, lit, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // texture() on a shadow sampler already returns the compared float —
+        // the universal `.r` idiom must be consumed (a scalar swizzle is
+        // "'scalar swizzle' : not supported with this profile: es")
+        assertTrue(out.contains("float lit = texture("))
+        assertTrue(!out.contains(").r;") && !out.contains(").x;"))
+        // the comparison type becomes a precision-qualified shadow sampler
+        assertTrue(out.contains("mediump sampler2DShadow g_ShadowMap;"))
+    }
+
+    @Test
+    fun `shadow sampler texture result is not wrapped with a bogus swizzle`() {
+        val src = """
+uniform sampler2DShadow g_ShadowMap;
+varying vec4 v_TexCoord;
+float shade() {
+        return texture(g_ShadowMap, vec3(v_TexCoord.xy, v_TexCoord.z));
+}
+void main() {
+        out_FragColor = vec4(shade());
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // the return is a float-typed call into a float function — NO `.x`
+        // wrap may appear (the pass once typed shadow texture() as vec4)
+        assertTrue(out.contains("return texture(g_ShadowMap, vec3(v_TexCoord.xy, v_TexCoord.z));"))
+    }
+
+    // ═════════════════════ v0.7.19: xray patch idempotence ═════════════════════
+
+    @Test
+    fun `xray patch is idempotent on pre-patched assets`() {
+        // The CURRENT built-in xray vert ships pre-patched: the varying is
+        // already followed by the patch's uniform
+        val prePatchedVert = """
+uniform mat4 g_ModelViewProjectionMatrix;
+attribute vec3 a_Position;
+varying float v_PointerScale;
+uniform vec4 g_PointerState;
+void main() {
+        gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+        v_PointerScale = 1.0;
+}
+""".trimStart()
+        val out = PcShaderFixes.fixShader("xray", prePatchedVert)
+        // re-applying the patch must NOT duplicate the uniform (an ESSL
+        // redefinition error)
+        assertEquals(1, Regex("uniform vec4 g_PointerState;").findAll(out).count())
+    }
+
+    @Test
+    fun `duplicate identical uniform declarations are deduplicated`() {
+        val src = """
+uniform sampler2D g_Texture0;
+varying float v_PointerScale;
+uniform vec4 g_PointerState;
+uniform vec4 g_PointerState;
+void main() {
+        out_FragColor = vec4(g_PointerState.y);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        assertEquals(1, Regex("uniform vec4 g_PointerState;").findAll(out).count())
+    }
+
+    @Test
+    fun `referenced but undeclared g_PointerState gets declared`() {
+        val src = """
+varying vec4 v_TexCoord;
+void main() {
+        vec2 unprojectedUVs = v_TexCoord.xy * CAST2(1.0 / max(0.00001, g_PointerState.y));
+        out_FragColor = vec4(unprojectedUVs, 0.0, 1.0);
+}
+""".trimStart()
+        val out = ShaderEsslSafety.apply(src)
+        // the preview-variant xray frag references the engine-bound uniform
+        // without a declaration — the pass declares it (the engine binds by
+        // name, exactly as for the declaration the patch itself inserts)
+        assertTrue(out.startsWith("uniform vec4 g_PointerState;"))
+    }
 }

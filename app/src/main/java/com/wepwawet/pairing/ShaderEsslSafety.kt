@@ -151,7 +151,7 @@ object ShaderEsslSafety {
 
     // ═══════════════════════════════ types ═══════════════════════════════
 
-    private enum class B { F, I, U, BO, S, M, VO, UNK }
+    private enum class B { F, I, U, BO, S, SH, M, VO, UNK }
 
     private class Ty(val b: B, val n: Int = 1, val arr: Boolean = false) {
         val isNumericScalar get() = n == 1 && (b == B.F || b == B.I || b == B.U)
@@ -171,8 +171,9 @@ object ShaderEsslSafety {
         "bool" -> Ty.BO1; "bvec2" -> Ty(B.BO, 2); "bvec3" -> Ty(B.BO, 3); "bvec4" -> Ty(B.BO, 4)
         "mat2" -> Ty(B.M, 2); "mat3" -> Ty(B.M, 3); "mat4" -> Ty(B.M, 4)
         "void" -> Ty.VOID
-        "sampler2D", "sampler3D", "samplerCube", "sampler2DShadow", "samplerCubeShadow",
+        "sampler2D", "sampler3D", "samplerCube",
         "sampler2DArray", "isampler2D", "usampler2D", "samplerExternalOES" -> Ty(B.S)
+        "sampler2DShadow", "samplerCubeShadow" -> Ty(B.SH)
         else -> null
     }
 
@@ -194,7 +195,7 @@ object ShaderEsslSafety {
         else -> null
     }
 
-    private class FnSig(val ret: Ty)
+    private class FnSig(val ret: Ty, val params: List<Ty> = emptyList())
 
     // ═══════════════ built-in function return types ══════════════════════
 
@@ -224,9 +225,117 @@ object ShaderEsslSafety {
         "dFdx", "dFdy", "fwidth", "saturate", "frac", "fmod", "lerp", "mod2", "not"
     )
 
+    /**
+     * v0.7.19: builtins that in ESSL 3.00 ONLY have (genType, genType)
+     * signatures — NO scalar overloads (verified against the ESSL 3.00 spec
+     * §8.2/8.3: pow, reflect and the two-argument atan lack mixed forms in
+     * every position, while mix/mod/min/max/clamp DO have scalar overloads
+     * and must NOT be rewritten; step accepts a scalar only in the EDGE
+     * (first) position). fxc broadcasts scalar arguments
+     * (pow(float3, float) etc.), so shaders written for the PC use the mixed
+     * form (e.g. the current filmgrain's `pow(noise, g_NoisePower)` with
+     * noise:vec3). The official APK's own shaders use the explicit form
+     * (`pow(v, CAST3(2.4))` in combine_hdr.frag) — confirming the engine
+     * dialect expects the broadcast to be explicit. Value = the argument
+     * positions that REQUIRE genType.
+     */
+    private val SCALAR_VECTOR_BUILTINS: Map<String, Set<Int>> = mapOf(
+        "pow" to setOf(0, 1),
+        "reflect" to setOf(0, 1),
+        "atan" to setOf(0, 1),
+        "step" to setOf(1),
+    )
+
+    /**
+     * v0.7.19: parameter types of the ENGINE's include-set functions
+     * (the engine's shader include set — common.h, common_blur.h,
+     * common_blending.h, common_composite.h, common_fog.h, common_particles.h,
+     * common_pbr.h, common_pbr_2.h, common_perspective.h, common_foliage.h
+     * and the base headers), extracted from the official Android APK's
+     * shipped headers. The safety pass cannot see the include files
+     * themselves (they live inside the engine), so their signatures are
+     * pinned here for implicit-argument-conversion fixes (e.g. shimmer.frag's
+     * rotateVec2(v_TexCoord, …) with a vec4 argument).
+     */
+    private val HEADER_FUNCTIONS: Map<String, List<List<Ty>>> = mapOf(
+        "ApplyAlphaToCoverage" to listOf(listOf(Ty.F1)),
+        "ApplyAmbientLighting" to listOf(listOf(Ty.F3)),
+        "ApplyBlending" to listOf(listOf(Ty.I1, Ty.F3, Ty.F3, Ty.F1)),
+        "ApplyComposite" to listOf(listOf(Ty.F4, Ty.F4)),
+        "ApplyCompositeOffset" to listOf(listOf(Ty.F2, Ty.F2)),
+        "ApplyFog" to listOf(listOf(Ty.F3, Ty.F2)),
+        "ApplyFogAlpha" to listOf(listOf(Ty.F1, Ty.F2)),
+        "ApplyPosition" to listOf(listOf(Ty.F3, Ty.F4)),
+        "ApplyPositionNormal" to listOf(listOf(Ty.F3, Ty.F3, Ty.F4, Ty.F3)),
+        "ApplySkinningPosition" to listOf(listOf(Ty.F3, Ty(B.U, 4), Ty.F4, Ty.F4)),
+        "ApplySkinningPositionNormal" to listOf(listOf(Ty.F3, Ty.F3, Ty(B.U, 4), Ty.F4, Ty.F4, Ty.F3)),
+        "ApplySkinningTangentSpace" to listOf(listOf(Ty.F3, Ty.F4, Ty(B.U, 4), Ty.F4, Ty.F3, Ty.F3)),
+        "ApplyTangentSpace" to listOf(listOf(Ty.F3, Ty.F4, Ty.F3, Ty.F3)),
+        "BlendColor" to listOf(listOf(Ty.F3, Ty.F3)),
+        "BlendHue" to listOf(listOf(Ty.F3, Ty.F3)),
+        "BlendLuminosity" to listOf(listOf(Ty.F3, Ty.F3)),
+        "BlendSaturation" to listOf(listOf(Ty.F3, Ty.F3)),
+        "BuildTangentSpace" to listOf(listOf(Ty.F3, Ty.F4), listOf(Ty(B.M, 3), Ty.F3, Ty.F4)),
+        "CalcFoliageAnimation" to listOf(listOf(Ty.F3, Ty.F3, Ty.F2, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F2)),
+        "CalcLeavesUVWeight" to listOf(listOf(Ty.F2, Ty.F2)),
+        "CalculateFogPixelState" to listOf(listOf(Ty.F1, Ty.F1)),
+        "CalculateProjectedCoords" to listOf(listOf(Ty.F3, Ty(B.M, 4))),
+        "CalculateProjectedCoordsCascades" to listOf(listOf(Ty.F3, Ty(B.M, 4))),
+        "CalculateProjectedCoordsPoint" to listOf(listOf(Ty.F3, Ty.F3, Ty.F4, Ty.F4)),
+        "ClipSpaceToScreenSpace" to listOf(listOf(Ty.F4, Ty.F3)),
+        "CombineLighting" to listOf(listOf(Ty.F3, Ty.F3), listOf(Ty.F3, Ty.F3, Ty.F3)),
+        "ComputeLight" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F1)),
+        "ComputeLightSpecular" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F1, Ty.F3, Ty.F1, Ty.F1, Ty.F1, Ty.F1, Ty.F3)),
+        "ComputeMaterialSpecularPower" to listOf(listOf(Ty.F1, Ty.F1)),
+        "ComputeMaterialSpecularStrength" to listOf(listOf(Ty.F1, Ty.F1)),
+        "ComputePBRLight" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F1, Ty.F1)),
+        "ComputePBRLightShadow" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F1, Ty.F1, Ty.F1, Ty.F3, Ty.F3, Ty.F1, Ty.F1, Ty.F1)),
+        "ComputePBRLightShadowInfinite" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F1, Ty.F1, Ty.F1)),
+        "ComputeParticlePosition" to listOf(listOf(Ty.F2, Ty.F1, Ty.F4, Ty.F3, Ty.F3)),
+        "ComputeParticleTangents" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3)),
+        "ComputeParticleTrailTangents" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F3)),
+        "ComputeScreenRefractionCoord" to listOf(listOf(Ty.F3, Ty.F3)),
+        "ComputeScreenRefractionTangents" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F3, Ty.F4)),
+        "ComputeSpriteFrame" to listOf(listOf(Ty.F1, Ty.F4, Ty.F2, Ty.F1)),
+        "ContrastSaturationBrightness" to listOf(listOf(Ty.F3, Ty.F1, Ty.F1, Ty.F1)),
+        "ConvertSampleR8" to listOf(listOf(Ty.F4)),
+        "ConvertTexture0Format" to listOf(listOf(Ty.F4)),
+        "ConvertTextureFormat" to listOf(listOf(Ty.I1, Ty.F4)),
+        "DecompressNormal" to listOf(listOf(Ty.F4)),
+        "DecompressNormalWithMask" to listOf(listOf(Ty.F4)),
+        "Desaturate" to listOf(listOf(Ty.F3, Ty.F1)),
+        "Distribution_GGX" to listOf(listOf(Ty.F3, Ty.F3, Ty.F1)),
+        "FresnelSchlick" to listOf(listOf(Ty.F1, Ty.F3)),
+        "GeoSmith" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3, Ty.F1)),
+        "HSLToRGB" to listOf(listOf(Ty.F3)),
+        "HueToRGB" to listOf(listOf(Ty.F1, Ty.F1, Ty.F1)),
+        "PerformPointShadowMapping" to listOf(listOf(Ty.F4)),
+        "PerformShadowMapping" to listOf(listOf(Ty.F3, Ty.F4)),
+        "PointSegmentDelta" to listOf(listOf(Ty.F3, Ty.F3, Ty.F3)),
+        "RGBToHSL" to listOf(listOf(Ty.F3)),
+        "Schlick_GGX" to listOf(listOf(Ty.F1, Ty.F1)),
+        "blur13" to listOf(listOf(Ty.F2, Ty.F2)),
+        "blur13a" to listOf(listOf(Ty.F2, Ty.F2)),
+        "blur3" to listOf(listOf(Ty.F2, Ty.F2)),
+        "blur3a" to listOf(listOf(Ty.F2, Ty.F2)),
+        "blur7" to listOf(listOf(Ty.F2, Ty.F2)),
+        "blur7a" to listOf(listOf(Ty.F2, Ty.F2)),
+        "blurRadial13a" to listOf(listOf(Ty.F2, Ty.F2, Ty.F1)),
+        "blurRadial3a" to listOf(listOf(Ty.F2, Ty.F2, Ty.F1)),
+        "blurRadial7a" to listOf(listOf(Ty.F2, Ty.F2, Ty.F1)),
+        "blurRotateVec2" to listOf(listOf(Ty.F2, Ty.F1)),
+        "greyscale" to listOf(listOf(Ty.F3)),
+        "hsv2rgb" to listOf(listOf(Ty.F3)),
+        "random" to listOf(listOf(Ty.F2)),
+        "rgb2hsv" to listOf(listOf(Ty.F3)),
+        "rotateVec2" to listOf(listOf(Ty.F2, Ty.F1)),
+        "squareToQuad" to listOf(listOf(Ty.F2, Ty.F2, Ty.F2, Ty.F2)),
+    )
+
     private fun promote(a: Ty, b: Ty): Ty {
         if (a.b == B.UNK || b.b == B.UNK) return Ty.UNK
-        if (a.b == B.S || b.b == B.S || a.b == B.M || b.b == B.M || a.b == B.VO || b.b == B.VO) return Ty.UNK
+        if (a.b == B.S || b.b == B.S || a.b == B.SH || b.b == B.SH ||
+            a.b == B.M || b.b == B.M || a.b == B.VO || b.b == B.VO) return Ty.UNK
         val base = if (a.b == B.F || b.b == B.F) B.F else if (a.b == B.U || b.b == B.U) B.U else B.I
         return Ty(base, maxOf(a.n, b.n))
     }
@@ -235,21 +344,327 @@ object ShaderEsslSafety {
 
     private class Edit(val pos: Int, val text: String, val closing: Boolean = false)
 
+    /**
+     * v0.7.19 (blur-include hoist): the engine's only header that references
+     * a sampler it does not declare is common_blur.h (every blur*() helper
+     * samples g_Texture0). The real PC pipeline NEVER fixes the resulting
+     * declaration order — wallpaperui.exe's blur fix is dead code (its regex
+     * `^(#include "common_blur\.h")` is anchored with the optimize flag and
+     * no multiline bit, so `^` can only match at offset 0; proven against the
+     * official Android APK, which ships blur_k3.frag / editorpaintbrush.frag
+     * with the include ABOVE the uniform) — so PC-made .mpkgs carry shaders
+     * where the inlined blur functions reference g_Texture0 before its
+     * declaration. The Android engine inlines #include at the directive line
+     * and its strict compiler then rejects the shader ('g_Texture0' :
+     * undeclared identifier — observed in the engine's own failure log for
+     * blur_precise_gaussian.frag), silently dropping the whole effect.
+     *
+     * This pass reproduces, in the safety layer, exactly the hoist the PC's
+     * dead blur-fix stage was designed to perform:
+     *   • delete every `uniform sampler2D g_Texture0;` that appears AFTER the
+     *     `#include "common_blur.h"` line (substring deletion, like the PC's
+     *     icase regex; a trailing metadata comment survives on its line)
+     *   • insert one `uniform sampler2D g_Texture0;\n` immediately before the
+     *     include line (the PC's 29-byte replacement string)
+     * A shader that already declares g_Texture0 above the include (e.g.
+     * godrays_gaussian.frag) is left byte-identical.
+     */
+    private val BLUR_INCLUDE_LINE = Regex("""^[ \t]*#[ \t]*include[ \t]*"common_blur\.h""", RegexOption.MULTILINE)
+    private val G_TEXTURE0_DECL = Regex("""uniform[ \t]+sampler2D[ \t]+g_Texture0[ \t]*;""", RegexOption.IGNORE_CASE)
+    private const val G_TEXTURE0_HOIST = "uniform sampler2D g_Texture0;\n"
+
+    private fun blurIncludeHoist(content: String): String {
+        val inc = BLUR_INCLUDE_LINE.find(content) ?: return content
+        val after = content.substring(inc.range.last + 1)
+        if (!G_TEXTURE0_DECL.containsMatchIn(after)) return content
+        // Delete every declaration after the include, then hoist one before it.
+        val cleanedAfter = G_TEXTURE0_DECL.replace(after) { "" }
+        val cleaned = content.substring(0, inc.range.last + 1) + cleanedAfter
+        return cleaned.substring(0, inc.range.first) + G_TEXTURE0_HOIST +
+            cleaned.substring(inc.range.first)
+    }
+
+    /**
+     * v0.7.19 (reserved-word identifiers): GLSL ES 3.00 §3.7 reserves a list
+     * of words that HLSL happily allows as identifiers — most notably
+     * `input` and `output` (the PC's current blend.frag / blendgradient.frag
+     * declare `vec4 input = albedo;` inside #if WRITEALPHA, so any wallpaper
+     * using the blend effect with Write-Alpha enabled ships a shader that
+     * spec-strict compilers reject with "'input' : Reserved word"). Rename
+     * every DECLARED identifier whose name is reserved, using the PC's own
+     * deprecation naming convention (`_deprFn_0` for the mod() rename):
+     * `_deprVar_0`, `_deprVar_1`, … All occurrences of the name are renamed
+     * (declaration + uses), except member accesses (`x.input`) whose struct
+     * is defined elsewhere, and preprocessor/comment text.
+     */
+    private val ESSL_RESERVED_WORDS = setOf(
+        "input", "output", "half", "fixed", "double", "filter", "superp", "packed",
+        "this", "sizeof", "cast", "namespace", "using", "asm", "class", "union",
+        "enum", "typedef", "template", "goto", "inline", "noinline", "volatile",
+        "public", "static", "extern", "external", "interface", "flat", "long",
+        "short", "unsigned", "hvec2", "hvec3", "hvec4", "dvec2", "dvec3", "dvec4",
+        "fvec2", "fvec3", "fvec4", "sampler1D", "sampler1DShadow", "sampler2DRect",
+        "sampler2DRectShadow", "sampler3DRect", "image1D", "image2D", "image3D",
+        "imageCube", "image1DArray", "image2DArray", "iimage", "uimage", "noise1",
+        "noise2", "noise3", "noise4"
+    )
+
+    private fun renameReservedIdentifiers(content: String): Pair<String, List<String>> {
+        val toks = lex(content) ?: return content to emptyList()
+        val code = toks.filter { it.kind != TKind.WS && it.kind != TKind.COMMENT }
+        // 1) find declarations of reserved names: TYPE_KEYWORD <reserved> …
+        val declared = LinkedHashSet<String>()
+        for (k in 0 until code.size) {
+            val t = code[k]
+            if (t.kind != TKind.IDENT) continue
+            if (typeKeyword(t.s) == null && t.s !in MODIFIERS) continue
+            // scan forward: modifiers/precision then the identifier
+            var j = k + 1
+            while (j < code.size && (code[j].kind == TKind.IDENT && code[j].s in MODIFIERS)) j++
+            val nameTok = code.getOrNull(j) ?: continue
+            if (nameTok.kind == TKind.IDENT && nameTok.s in ESSL_RESERVED_WORDS) {
+                declared.add(nameTok.s)
+            }
+        }
+        if (declared.isEmpty()) return content to emptyList()
+        // 2) rename every occurrence (except after '.' — struct member access
+        //    whose definition may live in an include). IDENT tokens are all in
+        //    the code subsequence, so walking it covers every occurrence.
+        val renames = HashMap<String, String>()
+        var n = 0
+        for (d in declared) { renames[d] = "_deprVar_${n}"; n++ }
+        val sb = StringBuilder(content.length)
+        var cursor = 0
+        val notes = ArrayList<String>()
+        for (ci in code.indices) {
+            val t = code[ci]
+            if (t.kind != TKind.IDENT || t.s !in renames) continue
+            val prev = if (ci > 0) code[ci - 1] else null
+            if (prev?.punct(".") == true) continue
+            sb.append(content, cursor, t.start)
+            sb.append(renames[t.s]!!)
+            cursor = t.end
+            notes.add("reserved-word rename ${t.s}→${renames[t.s]} @char${t.start}")
+        }
+        sb.append(content, cursor, content.length)
+        return sb.toString() to notes
+    }
+
+    /**
+     * v0.7.19 note (#require): `#require LightingV1` (used by the current
+     * fluidsimulation_combine.frag, chroma4.frag, generic4.frag, fur4.frag,
+     * foliage4.frag, genericparticle.frag — all shipped in the official APK)
+     * is the ENGINE's feature-injection directive: the engine's shader loader
+     * consumes it and injects the LightingV1 feature code (the embedded
+     * `vec3 PerformLighting_V1(vec3, vec3, vec3, vec3, vec3, vec3, float,
+     * float)` body lives as a string inside libscenejni.so at 0xc654cf,
+     * assembled with the g_LPoint_ / g_LTube_ / g_LDirectional_ uniform blocks
+     * also embedded there). It must therefore ship VERBATIM in the .mpkg —
+     * stripping it would prevent the injection and break the shader on the
+     * phone. No rewrite is performed; this note exists so future agents do
+     * not "fix" it away (an earlier draft of this pass stripped it — wrong).
+     */
+
+    /**
+     * v0.7.19 (shadow-sampler translation): `sampler2DComparison` /
+     * `texSample2DCompare` are Wallpaper Engine's PC-side shadow-sampling
+     * constructs. NEITHER exists on the Android engine: the engine's prepended
+     * define block (disassembled at libscenejni.so 0x2606fbc) only defines
+     * texSample2D / texSample2DLod / texSample3D, and the strings
+     * "sampler2DComparison" / "texSample2DCompare" appear nowhere in
+     * libscenejni.so — yet the APK's own common_pbr_2.h calls them (dead
+     * PC-only paths that Android never compiles). GLSL ES 3.00's native
+     * equivalents are sampler2DShadow + texture(s, vec3(uv, ref)), which is
+     * what the PC's HLSL SampleCmp maps to. Translate both so shadow-mapped
+     * effects (fluidsimulation with LIGHTS_SHADOW_MAPPING, workshop shaders
+     * using PerformShadowMapping) compile on the phone instead of being
+     * silently dropped.
+     */
+    private val SAMPLER_COMPARISON_TYPE = Regex("""\bsampler2DComparison\b""")
+    // ESSL requires an explicit precision qualifier on non-sampler2D sampler
+    // types ("'sampler2DShadow' : type requires declaration of default
+    // precision qualifier" — glslang 16.6), so the replacement carries one.
+    private const val SAMPLER_SHADOW_TYPE = "mediump sampler2DShadow"
+
+    /**
+     * texSample2DCompare(s, uv, ref) → texture(s, vec3(uv, ref)) — a balanced
+     * scanner (the same argument-splitting rules as the PC's BlendOpacity
+     * fixer): top-level commas split the three arguments; anything else is
+     * copied verbatim. Only fires on the exact 3-argument form; other shapes
+     * are left untouched.
+     *
+     * v0.7.19 (glslang 16.6 ground truth): texture() on a sampler2DShadow
+     * returns a SCALAR float, so a trailing component selection on the
+     * rewritten call (`texSample2DCompare(...).r`, the universal HLSL
+     * SampleCmp idiom) becomes a scalar swizzle — legal in desktop GLSL,
+     * "'scalar swizzle' : not supported with this profile: es" in ESSL 3.00
+     * (proven with the exact PerformShadowMapping body the engine's own
+     * common_pbr_2.h ships). The rewrite therefore CONSUMES one trailing
+     * .r/.x/.s selection when it directly follows the call.
+     */
+    private fun rewriteCompareSamplerCalls(content: String): Pair<String, List<String>> {
+        if (!content.contains("texSample2DCompare")) return content to emptyList()
+        val out = StringBuilder(content.length)
+        val notes = ArrayList<String>()
+        var i = 0
+        val n = content.length
+        while (i < n) {
+            val at = content.indexOf("texSample2DCompare", i)
+            if (at < 0) { out.append(content, i, n); break }
+            // must not be part of a longer identifier (texSample2DCompareLevelZero)
+            val afterName = at + "texSample2DCompare".length
+            val prevChar = if (at > 0) content[at - 1] else ' '
+            val nextChar = if (afterName < n) content[afterName] else ' '
+            val isIdent = prevChar.isLetterOrDigit() || prevChar == '_' || nextChar.isLetterOrDigit() || nextChar == '_'
+            var j = afterName
+            while (j < n && content[j].isWhitespace()) j++
+            if (isIdent || j >= n || content[j] != '(') {
+                out.append(content, i, afterName)
+                i = afterName
+                continue
+            }
+            // parse the balanced argument list starting at j '('
+            var depth = 0
+            val args = ArrayList<String>()
+            val cur = StringBuilder()
+            var k = j
+            var end = -1
+            while (k < n) {
+                val c = content[k]
+                when {
+                    c == '(' -> { depth++; if (depth > 1) cur.append(c) }
+                    c == ')' -> {
+                        depth--
+                        if (depth == 0) { args.add(cur.toString()); end = k + 1; break }
+                        cur.append(c)
+                    }
+                    c == ',' && depth == 1 -> { args.add(cur.toString()); cur.setLength(0) }
+                    else -> cur.append(c)
+                }
+                k++
+            }
+            if (end < 0 || args.size != 3) {
+                out.append(content, i, afterName)
+                i = afterName
+                continue
+            }
+            out.append(content, i, at)
+            out.append("texture(").append(args[0].trim())
+                .append(", vec3(").append(args[1].trim()).append(", ").append(args[2].trim()).append("))")
+            notes.add("texSample2DCompare→texture+vec3 @char$at")
+            i = end
+            // consume ONE trailing component selection — texture() on a
+            // shadow sampler already returns the compared float
+            var sw = i
+            while (sw < n && content[sw] == ' ') sw++
+            if (sw < n && content[sw] == '.' && sw + 1 < n &&
+                (content[sw + 1] == 'r' || content[sw + 1] == 'x' || content[sw + 1] == 's')) {
+                val afterSw = sw + 2
+                val nc = if (afterSw < n) content[afterSw] else ' '
+                if (!nc.isLetterOrDigit() && nc != '_') {
+                    notes.add("shadow-result .${content[sw + 1]} consumed @char$sw")
+                    i = afterSw
+                }
+            }
+        }
+        return out.toString() to notes
+    }
+
+    /**
+     * v0.7.19 (xray ground truth): the CURRENT built-in xray assets ship
+     * PRE-PATCHED — `varying float v_PointerScale;` is immediately followed
+     * by the patch's own `uniform vec4 g_PointerState;`, and the frag's
+     * `unprojectedUVs += 0.5;` is preceded by the patched
+     * `unprojectedUVs *= CAST2(1.0 / max(0.00001, g_PointerState.y));` line.
+     * Re-applying the PC's xray patch table (which the byte-parity port
+     * faithfully does) duplicates BOTH — and a duplicated uniform is a
+     * redefinition error in ESSL 3.00 (fxc tolerates it like a C tentative
+     * definition, so the PC pipeline never noticed). fxc-tolerant redeclared
+     * uniforms are deduplicated here: every later declaration whose
+     * `uniform <type> <name>;` text is IDENTICAL to an earlier one (ignoring
+     * the trailing metadata comment) is removed.
+     */
+    private val UNIFORM_DECL = Regex("""^[ \t]*uniform[ \t]+((?:\w+[ \t]+)*)(\w+)[ \t]*;""", RegexOption.MULTILINE)
+
+    private fun dedupeUniformDeclarations(content: String): Pair<String, List<String>> {
+        val seen = HashMap<String, Int>()          // "type name" -> count
+        var dup = false
+        for (m in UNIFORM_DECL.findAll(content)) {
+            val key = m.groupValues[1].replace(Regex("[ \t]+"), " ").trim() + " " + m.groupValues[2]
+            val c = seen.getOrDefault(key, 0)
+            seen[key] = c + 1
+            if (c + 1 > 1) dup = true
+        }
+        if (!dup) return content to emptyList()
+        val counts = HashMap<String, Int>()
+        val notes = ArrayList<String>()
+        val out = StringBuilder(content.length)
+        var cursor = 0
+        for (m in UNIFORM_DECL.findAll(content)) {
+            val key = m.groupValues[1].replace(Regex("[ \t]+"), " ").trim() + " " + m.groupValues[2]
+            val c = counts.getOrDefault(key, 0)
+            counts[key] = c + 1
+            if (c + 1 > 1) {
+                // remove the whole line (the declaration plus its newline)
+                var lineEnd = m.range.last + 1
+                while (lineEnd < content.length && content[lineEnd] != '\n') lineEnd++
+                if (lineEnd < content.length) lineEnd++
+                out.append(content, cursor, m.range.first)
+                cursor = lineEnd
+                notes.add("dedup uniform $key")
+            }
+        }
+        out.append(content, cursor, content.length)
+        return out.toString() to notes
+    }
+
+    /**
+     * v0.7.19 (xray preview ground truth): the PC's xray patch inserts a
+     * `g_PointerState.y` use gated on a `varying float v_PointerScale;`
+     * declaration that not every xray variant carries — when the varying is
+     * absent (the preview variant) the patched frag references an undeclared
+     * identifier. g_PointerState is an engine-bound uniform (the patch
+     * declares it as `uniform vec4 g_PointerState;` whenever it fires), so
+     * referencing it without a declaration is repaired by declaring it at
+     * the top of the file — the engine binds uniforms by name, exactly as it
+     * does for the declaration the patch itself inserts.
+     */
+    private fun declareMissingEngineUniforms(content: String): Pair<String, List<String>> {
+        val notes = ArrayList<String>()
+        var out = content
+        if (Regex("""\bg_PointerState\b""").containsMatchIn(out) &&
+            !Regex("""uniform[ \t]+vec4[ \t]+g_PointerState[ \t]*;""").containsMatchIn(out)) {
+            out = "uniform vec4 g_PointerState;\n" + out
+            notes.add("declared missing uniform vec4 g_PointerState")
+        }
+        return out to notes
+    }
+
     /** Public entry: apply the pass, returning the new source and a report. */
     fun applyWithReport(content: String): Pair<String, List<String>> {
-        val toks = lex(content) ?: return content to emptyList()
+        val (callRewritten, callNotes) = rewriteCompareSamplerCalls(content)
+        val shadowTyped = if (SAMPLER_COMPARISON_TYPE.containsMatchIn(callRewritten)) {
+            SAMPLER_COMPARISON_TYPE.replace(callRewritten) { SAMPLER_SHADOW_TYPE }
+        } else callRewritten
+        val shadowNotes = if (shadowTyped !== callRewritten) listOf("sampler2DComparison→sampler2DShadow") else emptyList()
+        val (deduped, dedupeNotes) = dedupeUniformDeclarations(shadowTyped)
+        val (declared, declareNotes) = declareMissingEngineUniforms(deduped)
+        val (renamed, renameNotes) = renameReservedIdentifiers(declared)
+        val hoisted = blurIncludeHoist(renamed)
+        val toks = lex(hoisted) ?: return content to emptyList()
         val edits = ArrayList<Edit>()
-        val notes = ArrayList<String>()
+        val notes = ArrayList<String>(callNotes + shadowNotes + dedupeNotes + declareNotes + renameNotes)
+        if (hoisted !== renamed) notes.add("blur-include hoist @char${BLUR_INCLUDE_LINE.find(renamed)?.range?.first}")
         val code = toks.filter { it.kind != TKind.WS && it.kind != TKind.COMMENT }
 
-        val p = ProgramParser(content, toks, code, edits, notes)
+        val p = ProgramParser(hoisted, toks, code, edits, notes)
         try {
             p.parseProgram()
         } catch (e: Exception) {
-            return content to emptyList()
+            return hoisted to notes
         }
-        if (!p.balanced) return content to emptyList()
-        if (edits.isEmpty()) return content to emptyList()
+        if (!p.balanced) return hoisted to notes
+        if (edits.isEmpty()) return hoisted to notes
 
         // Splice order for edits at the SAME position (nested wraps):
         //   1. closings, in collection order  (inner ')' before outer ')')
@@ -261,15 +676,15 @@ object ShaderEsslSafety {
         val sorted = edits.sortedWith(
             compareBy({ it.pos }, { if (it.closing) 0 else 1 }, { if (it.closing) seq[it]!! else -seq[it]!! })
         )
-        val sb = StringBuilder(content.length + 64)
+        val sb = StringBuilder(hoisted.length + 64)
         var cursor = 0
         for (e in sorted) {
-            if (e.pos < cursor) return content to emptyList()   // overlap → no edits
-            sb.append(content, cursor, e.pos)
+            if (e.pos < cursor) return hoisted to notes   // overlap → keep the hoist only
+            sb.append(hoisted, cursor, e.pos)
             sb.append(e.text)
             cursor = e.pos
         }
-        sb.append(content, cursor, content.length)
+        sb.append(hoisted, cursor, hoisted.length)
         return sb.toString() to notes
     }
 
@@ -294,6 +709,23 @@ object ShaderEsslSafety {
         abstract fun lookup(name: String): Ty?
         abstract fun lookupCallable(name: String): Ty?
 
+        /**
+         * v0.7.19: parameter types of a callable, for implicit-argument-
+         * conversion fixes (truncation / int→float). Returns null when the
+         * signature is unknown or the arg count doesn't fit any overload.
+         */
+        open fun paramTypesFor(name: String, argc: Int): List<Ty>? {
+            val overloads = HEADER_FUNCTIONS[name] ?: return null
+            for (ps in overloads) {
+                if (ps.size == argc) return ps
+            }
+            // a call with fewer args than params (default-valued params) also matches
+            for (ps in overloads) {
+                if (argc < ps.size) return ps.take(argc)
+            }
+            return null
+        }
+
         fun peek(k: Int = 0): Tok? = code.getOrNull(i + k)
         fun atEnd() = i >= code.size
         fun atP(p: String, k: Int = 0): Boolean = peek(k)?.punct(p) == true
@@ -306,21 +738,92 @@ object ShaderEsslSafety {
 
         fun tok(idx: Int): Tok? = code.getOrNull(idx)
 
+        /**
+         * v0.7.19: ESSL 3.00 has NO implicit int→float conversion — not in
+         * assignments, not in binary operators (verified with glslang 16.6:
+         * `float f = 5;` and `vec2 * 2` are both errors, while desktop GLSL
+         * and fxc accept both). The PC pipeline only rewrites integer
+         * LITERALS (its int→float regex), so `1.0 / numLayers` (int variable)
+         * survives PC processing and fails on strict ES compilers. Wrap the
+         * integer-typed operand in the matching float constructor — exactly
+         * the conversion fxc applies implicitly.
+         */
+        fun wrapIntToFloat(e: ERes) {
+            if (e.ty.b != B.I && e.ty.b != B.U) return
+            if (e.ty.n < 1 || e.ty.n > 4) return
+            val first = tok(e.startIdx) ?: return
+            val last = tok(e.endIdx) ?: return
+            val ctor = if (e.ty.n == 1) "float(" else "vec${e.ty.n}("
+            addEdit(first.start, ctor)
+            addEdit(last.end, ")", closing = true)
+            note("int→float", first)
+        }
+
+        /** true for float-based types (float / vecN) */
+        fun isFloatTy(t: Ty) = t.b == B.F
+        /** true for integer-based types (int/uint and their vectors) */
+        fun isIntTy(t: Ty) = t.b == B.I || t.b == B.U
+        /** true for any numeric scalar/vector base we can convert */
+        fun isNumericTy(t: Ty) =
+            (t.b == B.F || t.b == B.I || t.b == B.U || t.b == B.BO) && t.n in 1..4 && !t.arr
+
+        /**
+         * Mixed int/float arithmetic or comparison: wrap the int side.
+         * A scalar int works in any context after float() (vecN op float is
+         * legal ESSL); an ivecN only pairs with a matching-size or scalar
+         * float side after vecN(). Returns the promoted type of the pair so
+         * callers (ternary arms) record the CORRECT result type — otherwise
+         * the wrap's edit and the recorded type disagree and an outer pass
+         * wraps a second time (float(float(x))).
+         */
+        fun fixMixedIntFloat(lhs: ERes, rhs: ERes): Ty {
+            val lf = isFloatTy(lhs.ty); val rf = isFloatTy(rhs.ty)
+            val li = isIntTy(lhs.ty); val ri = isIntTy(rhs.ty)
+            fun sizesOk(intTy: Ty, floatTy: Ty) =
+                intTy.n == 1 || floatTy.n == 1 || intTy.n == floatTy.n
+            return when {
+                lf && ri && rhs.ty.n in 1..4 && sizesOk(rhs.ty, lhs.ty) -> {
+                    wrapIntToFloat(rhs); lhs.ty
+                }
+                rf && li && lhs.ty.n in 1..4 && sizesOk(lhs.ty, rhs.ty) -> {
+                    wrapIntToFloat(lhs); rhs.ty
+                }
+                else -> promote(lhs.ty, rhs.ty)
+            }
+        }
+
         // ── entry: full expression with assignment ──
         fun parseAssignExpr(): ERes {
             val lhs = parseExpr(2)
             val t = peek() ?: return lhs
-            if (t.kind == TKind.PUNCT && t.s == "=") {
+            if (t.kind == TKind.PUNCT && (t.s == "=" || t.s in COMPOUND_ASSIGN_OPS)) {
                 val lhsTy = lhs.ty
+                val compound = t.s != "="
                 i++
                 val rhs = parseAssignExpr()                // right-assoc
-                if (lhsTy.b != B.UNK && lhsTy.b != B.S && lhsTy.b != B.M && !lhsTy.arr) {
-                    wrapTruncation(lhsTy, rhs)
+                if (lhsTy.b != B.UNK && lhsTy.b != B.S && lhsTy.b != B.SH && lhsTy.b != B.M && !lhsTy.arr) {
+                    // v0.7.19: compound assignments (`a *= expr`) previously
+                    // fell through un-parsed — the whole RHS was skipped, so
+                    // int/float mixes and truncations inside them were missed
+                    if (!compound) {
+                        wrapTruncation(lhsTy, rhs)
+                    } else {
+                        // v0.7.19: `v *= intExpr` / `f += intExpr` — ESSL 3.00
+                        // has no implicit int→float in compound assignments
+                        // either (fxc promotes silently). Same-size or scalar
+                        // int RHS against a float LHS gets the ctor wrap.
+                        if (isFloatTy(lhsTy) && isIntTy(rhs.ty) &&
+                            (lhsTy.n == rhs.ty.n || rhs.ty.n == 1 || lhsTy.n == 1)) {
+                            wrapIntToFloat(rhs)
+                        }
+                    }
                 }
                 return ERes(lhsTy, lhs.startIdx, rhs.endIdx)
             }
             return lhs
         }
+
+        private val COMPOUND_ASSIGN_OPS = setOf("+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=")
 
         // ── binary / ternary; stops at '=', ',', ';', ')' … ──
         private fun parseExpr(minPrec: Int): ERes {
@@ -345,7 +848,13 @@ object ShaderEsslSafety {
                         val thenE = parseAssignExpr()
                         if (atP(":")) i++
                         val elseE = parseExpr(2)            // right-assoc chain
-                        val rty = if (thenE.ty.b != B.UNK) thenE.ty else elseE.ty
+                        // v0.7.19: mixed ternary arms (`c ? 1 : 0.5`, `c ? i : f`)
+                        // — fxc promotes the int arm to float; ESSL 3.00
+                        // requires identical arm types. The promoted type is
+                        // recorded so an outer assignment does not wrap twice.
+                        val armTy = fixMixedIntFloat(thenE, elseE)
+                        val rty = if (armTy.b != B.UNK) armTy else
+                            (if (thenE.ty.b != B.UNK) thenE.ty else elseE.ty)
                         lhs = ERes(rty, lhs.startIdx, elseE.endIdx)
                     }
                     op == "||" || op == "&&" -> {
@@ -381,8 +890,14 @@ object ShaderEsslSafety {
                 "|", "&", "^" -> promoteInt(lhs.ty, rhs.ty)
                 else -> promote(lhs.ty, rhs.ty)
             }
+            // v0.7.19: mixed int/float arithmetic/comparison — ESSL 3.00 has
+            // no implicit int→float (fxc does). Wrap the integer operand.
+            if (opTok in ARITH_CMP_OPS) fixMixedIntFloat(lhs, rhs)
             return ERes(ty, lhs.startIdx, rhs.endIdx)
         }
+
+        private val ARITH_CMP_OPS = setOf("+", "-", "*", "/", "%",
+            "==", "!=", "<", ">", "<=", ">=")
 
         private fun promoteInt(a: Ty, b: Ty): Ty {
             if (a.b == B.UNK || b.b == B.UNK) return Ty.UNK
@@ -448,7 +963,8 @@ object ShaderEsslSafety {
                         if (nt.s.isNotEmpty() && nt.s.all { it in "xyzwrgbastpq" }) {
                             i += 2
                             val cnt = minOf(4, nt.s.length)
-                            val base = if (r.ty.b == B.UNK || r.ty.b == B.S || r.ty.b == B.M || r.ty.b == B.VO) B.UNK else r.ty.b
+                            val base = if (r.ty.b == B.UNK || r.ty.b == B.S || r.ty.b == B.SH ||
+                                r.ty.b == B.M || r.ty.b == B.VO) B.UNK else r.ty.b
                             r = ERes(Ty(base, cnt), r.startIdx, i - 1)
                             continue
                         }
@@ -459,7 +975,21 @@ object ShaderEsslSafety {
                     break
                 } else if (t.punct("[")) {
                     i++
-                    parseAssignExpr()
+                    val idx = parseAssignExpr()
+                    // v0.7.19: float array/matrix subscript (`arr[f]`) — fxc
+                    // implicitly truncates float→int in subscripts; ESSL 3.00
+                    // requires a scalar integer expression. (The engine team's
+                    // own APK ships `g_BlendMap[float(x) / 4.0]` — a float
+                    // subscript — in a dead branch of puppettexturechannels.)
+                    if (idx.ty.b == B.F && idx.ty.n == 1) {
+                        val first = tok(idx.startIdx)
+                        val last = tok(idx.endIdx)
+                        if (first != null && last != null) {
+                            addEdit(first.start, "int(")
+                            addEdit(last.end, ")", closing = true)
+                            note("subscript→int", first)
+                        }
+                    }
                     if (atP("]")) i++
                     val inner = when {
                         r.ty.arr -> Ty(r.ty.b, r.ty.n, false)
@@ -522,7 +1052,7 @@ object ShaderEsslSafety {
             val sc = scalarCtor(name)
             if (sc != null && args.size == 1) {
                 val a = args[0]
-                if (a.ty.n in 2..4 && a.ty.b != B.UNK && a.ty.b != B.S && a.ty.b != B.M) {
+                if (a.ty.n in 2..4 && a.ty.b != B.UNK && a.ty.b != B.S && a.ty.b != B.SH && a.ty.b != B.M) {
                     val first = tok(a.startIdx)
                     val last = tok(a.endIdx)
                     if (first != null && last != null) {
@@ -534,8 +1064,70 @@ object ShaderEsslSafety {
             }
             // NOTE: vector constructors from larger vectors are LEGAL ESSL (vec2(v4)), no rewrite.
 
+            // ── v0.7.19: genType-only builtins called with a scalar where the
+            // other argument is a vector (fxc/HLSL broadcasts the scalar;
+            // ESSL 3.00 has no pow(vecN,float)/reflect(vecN,float)/atan(y,x)
+            // mixed overloads). Wrap the scalar in the matching CASTN.
+            val genPositions = SCALAR_VECTOR_BUILTINS[name]
+            if (genPositions != null && args.size >= 2) {
+                val n = args.map { it.ty.n }.filter { it in 2..4 }.maxOrNull()
+                if (n != null) {
+                    for ((ai, a) in args.withIndex()) {
+                        if (ai !in genPositions) continue
+                        if (a.ty.n == 1 && isFloatTy(a.ty)) {
+                            val first = tok(a.startIdx)
+                            val last = tok(a.endIdx)
+                            if (first != null && last != null) {
+                                addEdit(first.start, "CAST$n(")
+                                addEdit(last.end, ")", closing = true)
+                                note("scalar→vec$n broadcast ($name)", first)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── v0.7.19: IMPLICIT ARGUMENT CONVERSIONS (fxc accepts any
+            // numeric base/size mix in arguments; ESSL 3.00 accepts NONE —
+            // glslang 16.6: `void f(int); f(1.0)` is an error, and so is
+            // `void f(vec2); f(1.0)` and `void f(int); f(i + 1.0)`).
+            // Applies to user functions declared in this file (the parser's
+            // scope) and to the ENGINE's include-set functions
+            // (HEADER_FUNCTIONS — common.h/common_blur.h/…, whose signatures
+            // are fixed and version-stable). Every mismatch gets an explicit
+            // constructor: truncation takes the leading components (fxc
+            // X3206), scalar args broadcast (fxc scalar promotion), base
+            // mixes convert (fxc implicit conversion).
+            val paramTys = paramTypesFor(name, args.size)
+            if (paramTys != null) {
+                for ((ai, a) in args.withIndex()) {
+                    if (ai >= paramTys.size) break
+                    val pt = paramTys[ai]
+                    if (pt == null) continue
+                    fixImplicitArgConversion(pt, a, name)
+                }
+            }
+
+            // ── v0.7.19 note: texSample2DCompare(A,B,C) → texture(A, vec3(B,C))
+            // is rewritten by the balanced pre-pass (rewriteCompareSamplerCalls)
+            // BEFORE lexing — the edit mechanism here is insert-only.
+
             val vc = vectorCtor(name)
             val ret: Ty = when {
+                // v0.7.19: texture() on a SHADOW sampler returns the compared
+                // float, not vec4 — typing it vec4 made the pass wrap return
+                // values with a bogus `.x` (a scalar swizzle error in ESSL).
+                // When the sampler's type is UNKNOWN (declared in another
+                // translation unit — e.g. an engine include processed
+                // standalone) the result is UNKNOWN too: assuming vec4 would
+                // corrupt shadow paths, and no edit is always safe.
+                (name == "texture" || name == "textureLod" || name == "texSample2DLod" ||
+                    name == "texSample2D" || name == "texSample2DBackBuffer" ||
+                    name == "texSample2DCompare") -> when (args.firstOrNull()?.ty?.b) {
+                    B.SH -> Ty.F1
+                    B.S -> Ty.F4
+                    else -> Ty.UNK
+                }
                 vc != null -> vc
                 sc != null -> Ty(sc, 1)
                 name == "mat2" -> Ty(B.M, 2)
@@ -558,6 +1150,53 @@ object ShaderEsslSafety {
             return ERes(ret, callStart, i - 1)
         }
 
+        /**
+         * v0.7.19: the ONE implicit-conversion routine for call arguments —
+         * replicates fxc's argument conversion table at source level:
+         *
+         *   arg N > param N   → leading components (fxc X3206 truncation)
+         *   arg N < param N   → scalar broadcast (vecN(arg)) — fxc promotes
+         *                       scalars to any vector size; ESSL needs the ctor
+         *   base mismatch      → explicit ctor of the PARAMETER type (fxc
+         *                       converts any numeric base silently; ESSL 3.00
+         *                       has NO implicit conversions at all — glslang
+         *                       16.6 rejects even `float f = intVar;`)
+         */
+        fun fixImplicitArgConversion(pt: Ty, a: ERes, fname: String) {
+            if (!isNumericTy(pt) || !isNumericTy(a.ty)) return
+            if (pt.b == a.ty.b && pt.n == a.ty.n) return
+            val first = tok(a.startIdx) ?: return
+            val last = tok(a.endIdx) ?: return
+            if (a.ty.n > pt.n) {
+                // truncation to the leading components
+                val swz = "." + "xyzw".take(pt.n)
+                if (pt.b == a.ty.b) {
+                    addEdit(first.start, "(")
+                    addEdit(last.end, ")$swz", closing = true)
+                    note("arg-truncation→$swz ($fname)", first)
+                } else {
+                    val ctor = if (pt.n == 1) scalarCtorName(pt.b) else vectorCtorName(pt)
+                    if (ctor == null) return
+                    addEdit(first.start, "$ctor((")
+                    addEdit(last.end, ")$swz)", closing = true)
+                    note("arg-truncation→$ctor$swz ($fname)", first)
+                }
+            } else if (a.ty.n < pt.n) {
+                if (a.ty.n != 1) return                  // vec→larger vec: fxc rejects too
+                val ctor = vectorCtorName(pt) ?: return
+                addEdit(first.start, "$ctor(")
+                addEdit(last.end, ")", closing = true)
+                note("arg-broadcast→$ctor ($fname)", first)
+            } else {
+                // same size, different base (incl. scalar/scalar)
+                val ctor = if (pt.n == 1) scalarCtorName(pt.b) else vectorCtorName(pt)
+                if (ctor == null) return
+                addEdit(first.start, "$ctor(")
+                addEdit(last.end, ")", closing = true)
+                note("arg-base→$ctor ($fname)", first)
+            }
+        }
+
         private fun numType(s: String): Ty = when {
             s.startsWith("0x") || s.startsWith("0X") -> Ty.I1
             s.endsWith("u") || s.endsWith("U") -> Ty(B.U)
@@ -572,23 +1211,32 @@ object ShaderEsslSafety {
          *
          *  A. implicit truncation  (fxc X3206): vecN → smaller type keeps the
          *     leading components          →  (expr).xyz
-         *  B. base conversion: fxc converts any numeric base implicitly
-         *     (float→int, anything→bool, bool→float, …) while ESSL only
-         *     allows int→uint, int→float and uint→float. Everything else
-         *     gets an explicit constructor. NOTE: the PC's own fixShader
-         *     int→float pass (`int d = 3;` → `int d = 3.0;`) lands here too
-         *     — fxc compiles that fine, strict ESSL does not.
+         *  B. scalar broadcast (fxc scalar promotion): `vec2 x = 1.0;` —
+         *     ESSL 3.00 requires an explicit vec2() ctor (glslang 16.6:
+         *     "cannot convert from 'const float' to '2-component vector'").
+         *     The engine team hit exactly this class: the APK's
+         *     editorpaintbrush.frag carries `vec2 texelSize = 1.0;` in a
+         *     never-compiled editor path.
+         *  C. base conversion: fxc converts any numeric base implicitly
+         *     (float→int, int→uint, anything→bool, …) while ESSL 3.00 has NO
+         *     implicit conversions at all — glslang 16.6 rejects even
+         *     `float f = intVar;` and `uint u = intVar;` (verified against
+         *     the exact engine view). Every mismatch gets an explicit ctor.
+         *     NOTE: the PC's own fixShader int→float pass (`int d = 3;` →
+         *     `int d = 3.0;`) lands here too — fxc compiles that fine,
+         *     strict ESSL does not.
          */
         fun wrapTruncation(lhs: Ty, rhs: ERes) {
             val rt = rhs.ty
-            if (rt.b == B.UNK || rt.b == B.S || rt.b == B.M || rt.b == B.VO || rt.arr) return
-            if (lhs.b == B.UNK || lhs.b == B.S || lhs.b == B.M || lhs.b == B.VO || lhs.arr) return
+            if (rt.b == B.UNK || rt.b == B.S || rt.b == B.SH || rt.b == B.M || rt.b == B.VO || rt.arr) return
+            if (lhs.b == B.UNK || lhs.b == B.S || lhs.b == B.SH || lhs.b == B.M || lhs.b == B.VO || lhs.arr) return
             if (rt.n !in 1..4 || lhs.n !in 1..4) return
             if (rt.b != B.F && rt.b != B.I && rt.b != B.U && rt.b != B.BO) return
             if (lhs.b != B.F && lhs.b != B.I && lhs.b != B.U && lhs.b != B.BO) return
             val truncates = rt.n > lhs.n
-            val convertsBad = lhs.b != rt.b && !esslImplicitlyConverts(rt.b, lhs.b)
-            if (!truncates && !convertsBad) return
+            val broadcasts = rt.n == 1 && lhs.n > 1
+            val convertsBad = lhs.b != rt.b
+            if (!truncates && !broadcasts && !convertsBad) return
             val first = tok(rhs.startIdx) ?: return
             val last = tok(rhs.endIdx) ?: return
 
@@ -599,34 +1247,34 @@ object ShaderEsslSafety {
                     addEdit(last.end, ")$swz", closing = true)
                 } else {
                     val ctor = scalarCtorName(lhs.b) ?: return
-                    addEdit(first.start, "$ctor(")
+                    addEdit(first.start, "$ctor((")
                     addEdit(last.end, ")$swz)", closing = true)
                 }
                 note("truncation→$swz", first)
+            } else if (broadcasts) {
+                // scalar → vector of any base: the ctor converts and
+                // broadcasts in one step (vec2(1.0), vec3(intScalar), …)
+                val ctor = vectorCtorName(lhs) ?: return
+                addEdit(first.start, "$ctor(")
+                addEdit(last.end, ")", closing = true)
+                note("broadcast→$ctor", first)
             } else {
-                // same size (or scalar broadcast), incompatible base
+                // same size, incompatible base
                 if (rt.n == lhs.n) {
-                    val ctor = scalarCtorName(lhs.b) ?: return
+                    val ctor = if (lhs.n == 1) scalarCtorName(lhs.b) else vectorCtorName(lhs)
+                    if (ctor == null) return
                     addEdit(first.start, "$ctor(")
                     addEdit(last.end, ")", closing = true)
                     note("base→${ctor}", first)
                 } else if (rt.n < lhs.n) {
-                    // scalar broadcast into a vector of another base
+                    // scalar broadcast into a vector of another base — both
+                    // fixes at once via the vector ctor
                     val ctor = vectorCtorName(lhs) ?: return
                     addEdit(first.start, "$ctor(")
                     addEdit(last.end, ")", closing = true)
                     note("base→${ctor}", first)
                 }
             }
-        }
-
-        /** ESSL 3.00 §4.1.10: only these implicit conversions exist. */
-        private fun esslImplicitlyConverts(from: B, to: B): Boolean = when {
-            from == to -> true
-            from == B.I && to == B.U -> true
-            from == B.I && to == B.F -> true
-            from == B.U && to == B.F -> true
-            else -> false
         }
 
         private fun scalarCtorName(b: B): String? = when (b) {
@@ -686,6 +1334,13 @@ object ShaderEsslSafety {
             return null
         }
 
+        override fun paramTypesFor(name: String, argc: Int): List<Ty>? {
+            functions[name]?.let { sig ->
+                if (sig.params.size == argc) return sig.params
+            }
+            return super.paramTypesFor(name, argc)
+        }
+
         fun parseProgram() {
             registerCombosAndSystemDefines()
             while (!atEnd()) {
@@ -713,6 +1368,13 @@ object ShaderEsslSafety {
             // and integer system defines (PLATFORM_ANDROID 1, GLSL 1, ...).
             for (n in listOf("PLATFORM_ANDROID", "GLSL", "HLSL", "SCENE_ORTHO",
                 "PLATFORM_DIRECTX", "PLATFORM_WINDOWS")) macroObj[n] = Ty.I1
+            // v0.7.19: built-in vertex-shader scalars — gl_VertexID/gl_InstanceID
+            // are int in ESSL 3.00 (HLSL declares them uint, and the engine's
+            // own model_vertex_v1.h morphing functions take `in uint vertexID`
+            // — the fxc-implicit int→uint at those call sites must become an
+            // explicit ctor on the strict compiler)
+            macroObj["gl_VertexID"] = Ty.I1
+            macroObj["gl_InstanceID"] = Ty.I1
             // Combos are declared three ways in WE shaders, and the engine
             // turns ALL of them into integer defines (verified:
             // `#define INVERT 0` in its own shader-compile log):
@@ -838,6 +1500,7 @@ object ShaderEsslSafety {
         private fun parseFunction(ret: Ty, nameTok: Tok) {
             i += 2
             val bodyScope = HashMap<String, Ty>()
+            val paramList = ArrayList<Ty>()
             if (!atP("(")) { skipToSemicolon(); return }
             i++
             while (!atEnd() && !atP(")")) {
@@ -854,6 +1517,7 @@ object ShaderEsslSafety {
                             i++
                         }
                         bodyScope[pname!!.s] = Ty(pty.b, pty.n, arr)
+                        paramList.add(Ty(pty.b, pty.n, arr))
                     }
                 } else if (!atP(",") && !atP(")")) {
                     i++
@@ -861,7 +1525,7 @@ object ShaderEsslSafety {
                 if (atP(",")) i++
             }
             if (atP(")")) i++
-            functions[nameTok.s] = FnSig(ret)
+            functions[nameTok.s] = FnSig(ret, paramList)
             if (atP(";")) { i++; return }                              // prototype
             fnReturns.addLast(ret)
             scopes.add(bodyScope)

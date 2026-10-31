@@ -2302,9 +2302,145 @@ VERIFICATION (all automated, this session)
     with workshopurl; the tex audit confirms fmt5 passthrough and fmt0
     conversion counts on every demo.
 
+HEAD
 Remaining known limitation: the ETC2 block bytes for DXT/BC sources are now
 produced by the same etcpack build the PC uses, but an end-to-end byte
 comparison against a PC-produced DXT->ETC2 texture still wants the original
 MSK12003_x.tex pair from the reference transfer to be re-shared (the repo's
 test resources only carry its LZ4 body size). Everything else about those
 outputs (header, dims, flags, LZ4, ordering) is byte-verified.
+
+## v0.7.19-alpha — the complete ESSL 3.00 argument/conversion parity pass (every fxc implicit conversion made explicit)
+
+Trigger: the REAL engine failure log of workshop 3588616811's audio_base.frag
+(2026-10-31, user-supplied applog.txt):
+
+  ERROR: 0:73:  '<'  : wrong operand types — 'in int' vs 'const float'
+  ERROR: 0:74:  '>=' : wrong operand types — 'in int' vs 'const float'
+  ERROR: 0:110: '-'  : wrong operand types — 'in int' vs 'const float'
+  ERROR: 0:112/113: '+' : wrong operand types — 'in int' vs 'const float'
+
+The v0.7.18 safety pass had no int/float operator handling at all (the
+v0.7.19 WIP added the comparisons but left the call arguments broken:
+`getAudioValueByBand(float(index) - 1.0)` — a float argument into the
+function's own `int index` parameter — "no matching overloaded function").
+
+### A. The authority question, settled empirically
+
+glslang 16.6 (Khronos reference validator, --stdin -S frag, ESSL 3.00)
+rejects EVERY implicit conversion — not just mixed operators:
+
+  `float f = 5;`  `float f = intVar;`  `uint u = intVar;`
+  `vec2 x = 1.0;` (scalar broadcast!)  `f(intParam){ f(1.0); }`
+  `vec2 v = ivec2(1);`  `2.0 * intVar`  `int == float`
+
+The user's device log proves the real Adreno driver agrees for operators.
+The APK's own shipped shaders prove the engine team fixed exactly these
+classes by hand (editorpaintbrush.frag: `(g_BrushColor).xyz`,
+`vec2 texelSize = 1.0;` in an editor-only path; puppettexturechannels.vert:
+`float(a_BlendIndices.x) / 4.0`). Conclusion: glslang-strict is the target —
+explicit constructors are valid on EVERY driver and never change fxc
+semantics.
+
+### B. ShaderEsslSafety.kt — the complete conversion matrix
+
+  • fixImplicitArgConversion (THE audio_base fix): fxc accepts any numeric
+    base/size mix in call arguments; ESSL accepts none. Truncation takes
+    the leading components (`(v4).xy`), scalar args broadcast
+    (`vec2(u_x)`), base mixes get the parameter's ctor
+    (`int(float(index) - 1.0)` — exactly fxc's promote-then-truncate).
+    Applies to user functions parsed in-file AND the pinned
+    HEADER_FUNCTIONS engine include set.
+  • wrapTruncation: + scalar broadcast (`vec2 x = 1.0;` → `vec2(1.0);`)
+    and the no-implicit-conversions reality (int→uint/uint→float wraps
+    too; same-size different-base uses the VECTOR ctor for vecN).
+  • esslImplicitlyConverts DELETED — ESSL 3.00 has NO implicit conversions
+    (the v0.7.18 table was wrong even for `uint u = intVar;`).
+  • Compound assignments: `v *= intExpr` / `f += intExpr` now parse their
+    RHS and wrap (`float(u_i)`) — they previously fell through unparsed.
+  • Array/matrix subscripts: float index → `int(...)` (the APK's own
+    dead-branch `g_BlendMap[float(x) / 4.0]` shows the class is real).
+  • Ternary arms: mixed int/float arms promote the int side; the promoted
+    type is recorded so outer assignments do not double-wrap
+    (float(float(x)) — caught by the new unit tests).
+  • Shadow samplers typed properly: new B.SH for sampler2DShadow;
+    texture()/textureLod/texSample2D* return FLOAT on a shadow sampler
+    (was vec4 → bogus `.x` wraps = scalar swizzle errors), and UNKNOWN
+    when the sampler's declaration is not visible (engine includes
+    processed standalone) — no edit is always safe.
+  • rewriteCompareSamplerCalls consumes the trailing `.r`/`.x`/`.s` on the
+    rewritten texSample2DCompare call — texture() on a shadow sampler
+    ALREADY returns the compared float; `.r` on it is
+    "'scalar swizzle' : not supported with this profile: es" (proven with
+    the exact PerformShadowMapping body the engine's common_pbr_2.h ships).
+    With this, the LIGHTS_SHADOW_MAPPING_QUALITY == 1 AND == 2 paths both
+    compile — no combo sanitization needed.
+  • dedupeUniformDeclarations: identical `uniform <type> <name>;`
+    redeclared (fxc tolerates like a C tentative definition; ESSL: error).
+  • declareMissingEngineUniforms: g_PointerState referenced-but-undeclared
+    (the xray preview variant) gets `uniform vec4 g_PointerState;` — the
+    engine binds uniforms by name exactly as for the patch's own insert.
+  • gl_VertexID/gl_InstanceID typed int (ESSL) — the engine's morphing
+    helpers take `in uint vertexID`, so those call sites wrap
+    uint(gl_VertexID).
+
+### C. PcShaderFixes.kt — xray patch made idempotent
+
+The CURRENT built-in xray assets ship PRE-PATCHED (the varying is already
+followed by `uniform vec4 g_PointerState;`, the frag already carries the
+`unprojectedUVs *= CAST2(1.0 / max(0.00001, g_PointerState.y));` line —
+both verified in we-assets). Re-applying the PC patch table duplicated
+BOTH (an ESSL redefinition error AND a doubled scale factor). Both
+sub-patches now fire only when their result is absent — the only behavior
+consistent with the shipped assets compiling.
+
+### D. Verification (the harness: scripts/parity3/)
+
+Rebuilt from scratch after the sandbox recycle: glslang 16.6
+(/home/z/tools), kotlinc 2.0.21, lz4-java 1.8.0, junit 4.13.2 (Aliyun
+mirror), the engine include set re-synthesized by running the PC's
+we-assets .h headers through our own chain (the APK's .h extraction was
+lost with ~/tools; the APK's own .frag fixes prove the fix classes).
+
+The engine view replicates the disassembled loader exactly (header, 23
+defines, combos, includes, audio uniforms, LightingV1 prototype, sampler
+precision) + four combo modes (default / off / on / two) where only
+ENGINE-SETTABLE combos flip (metadata + material JSON + the shader's own
+conditionals; include-only conditionals stay defined-0, arrays ≥ 1).
+
+  • ALL 138 packed-shader corpus files (every built-in effect the packer
+    processes, preview dirs excluded — PC-editor-only) PASS in all modes.
+  • zcompat 4/4, the reconstructed audio_base.frag fixture 1/1 (all
+    AUDIO_BANDS 0/1/2 × LOG_SCALE 0/1).
+  • APK control set (the engine's own 118 shaders, raw): 96 pass; the 22
+    failures are all PROVABLY not-our-pipeline: 6 pure-HLSL DX11 fallback
+    sources, 3 gl_InstanceID instancing shaders (ESSL 3.00 has no
+    gl_InstanceID — the engine never compiles them), driver-lenient
+    constructs the APK itself ships in editor/dead paths (scalar
+    broadcast, vec4→vec3, int literals), and the morphing uint-signature
+    in our synthesized include (the real APK .h is not available).
+  • ShaderEsslSafetyTest 34/34 (18 new tests: the audio_base ground
+    truth, broadcast, compound, subscript, ternary, arg conversions,
+    shadow samplers, xray idempotence/dedupe/declare).
+  • PcPipelineTest 31/31 — including the THREE byte-exact texture
+    rebuilds and the byte-exact pulse.frag / zcompat Simple_Audio_Bars
+    PC outputs (PC parity unbroken). Two stale tests updated to the
+    corrected ground truth: the trailing-newline rule (APK byte-size
+    proof) and the blur hoist (now in the safety layer — the PC stage is
+    dead code).
+
+Reminders for future agents:
+  59. ESSL 3.00 has ZERO implicit conversions (glslang 16.6 is the
+      authority; the real driver matches for operators). Every cross-base
+      or cross-size expression needs an explicit ctor — wrap, never pray.
+  60. texture() on a sampler2DShadow returns FLOAT. Never type it vec4,
+      never leave a trailing .r on a rewritten texSample2DCompare.
+  61. The engine's include set is ESSL-fixed INSIDE the APK — our mpkg
+      shaders only #include; the safety pass must be robust to samplers
+      it cannot see (UNKNOWN sampler type → UNKNOWN texture() result).
+  62. The xray patch table must stay idempotent — the shipped assets are
+      pre-patched, and a second application duplicates uniforms.
+  63. `vec2 x = 1.0;` (scalar broadcast init) is REJECTED by glslang but
+      the real driver ACCEPTS it — the APK ships live-looking examples.
+      We wrap anyway (vec2(1.0) is valid everywhere); the control-set
+      failures on this class are driver-lenient, not our bugs.

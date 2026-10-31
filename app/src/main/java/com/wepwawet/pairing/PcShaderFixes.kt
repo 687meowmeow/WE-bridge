@@ -12,11 +12,18 @@ package com.wepwawet.pairing
  *
  * Pipeline (order matters, verified from disassembly):
  *
- *  1. BLUR FIX — content-gated, runs BEFORE the name checks:
- *     if the content contains `^(#include "common_blur\.h")` (multiline):
- *       a. DELETE every `uniform sampler2D g_Texture0;` declaration
- *       b. rewrite the include line to
- *          `uniform sampler2D g_Texture0;\n$1`  (the g_Texture0-only hoist)
+ *  1. BLUR FIX — content-gated, runs BEFORE the name checks. VERIFIED DEAD
+ *     CODE on the real PC: the pattern stored in the binary's .rdata at
+ *     0x140ab2490 is `^(#include "common_blur\\.h")` — the runtime string
+ *     contains a LITERAL DOUBLE BACKSLASH, so as an ECMAScript regex it
+ *     requires a literal '\' character in the file before the '.' — which
+ *     no real shader contains. (Proof: the official Android APK ships
+ *     blur_k3.frag / editorpaintbrush.frag / common_blur.h with the include
+ *     line and every `uniform sampler2D g_Texture0;` UNTOUCHED — if the
+ *     blur fix fired, the uniform would have been hoisted above the
+ *     include.) We reproduce the regex verbatim (same dead pattern, same
+ *     icase uniform deletion) so that IF a file ever matched it we would
+ *     still produce the PC's exact bytes — and real files never match.
  *
  *  2. NAME-GATED PATCHES — the effect name (shader file stem, e.g.
  *     "xray" for shaders/effects/xray.frag) is compared for EXACT
@@ -92,8 +99,8 @@ object PcShaderFixes {
         ShaderEsslSafety.apply(fixShader(name, deprModFix(content)))
 
     // ── Stage 1: blur ──────────────────────────────────────────────────────
-    private val BLUR_INCLUDE = Regex("""^(#include "common_blur\.h")""", RegexOption.MULTILINE)
-    private const val BLUR_UNIFORM = "uniform sampler2D g_Texture0;"
+    private val BLUR_INCLUDE = Regex("""^(#include "common_blur\\.h")""")
+    private val BLUR_UNIFORM = Regex("""uniform sampler2D g_Texture0;""", RegexOption.IGNORE_CASE)
     private const val BLUR_REPLACEMENT = "uniform sampler2D g_Texture0;\n"
 
     // ── Stage 2: name-gated patches ────────────────────────────────────────
@@ -110,6 +117,7 @@ object PcShaderFixes {
     private const val XRAY_VARYING = "varying float v_PointerScale;"
     private const val XRAY_VARYING_REPLACEMENT = "varying float v_PointerScale;\nuniform vec4 g_PointerState;"
     private const val XRAY_UNPROJECTED_SEARCH = """unprojectedUVs \+= 0\.5;"""
+    private const val XRAY_UNPROJECTED_MARK = "unprojectedUVs *= CAST2(1.0 / max(0.00001, g_PointerState.y));"
     private const val XRAY_UNPROJECTED_REPLACEMENT =
         "unprojectedUVs *= CAST2(1.0 / max(0.00001, g_PointerState.y));\nunprojectedUVs += 0.5;"
     private const val XRAY_MVPINV = "uniform mat4 g_ModelViewProjectionMatrixInverse;"
@@ -160,7 +168,7 @@ object PcShaderFixes {
 
         // ── 1. blur (content-gated, before the name chain) ──
         if (BLUR_INCLUDE.containsMatchIn(c)) {
-            c = c.replace(BLUR_UNIFORM, "")
+            c = BLUR_UNIFORM.replace(c, "")
             c = BLUR_INCLUDE.replace(c) { m -> BLUR_REPLACEMENT + m.groupValues[1] }
         }
 
@@ -182,10 +190,23 @@ object PcShaderFixes {
                 }
             }
             "xray" -> {
-                if (c.contains(XRAY_VARYING)) {
+                // v0.7.19 (pre-patched asset ground truth): the CURRENT xray
+                // assets ship with the patch already applied — `varying float
+                // v_PointerScale;` is followed by the patch's own
+                // `uniform vec4 g_PointerState;`, and the frag already carries
+                // the `unprojectedUVs *= CAST2(1.0 / max(0.00001,
+                // g_PointerState.y));` line. Re-applying would duplicate both
+                // (a uniform redefinition error in ESSL 3.00, and a doubled
+                // scale factor in the math). Both sub-patches are therefore
+                // IDEMPOTENT: they fire only when their result is not already
+                // present, which is the only behavior consistent with the
+                // shipped assets compiling on the engine.
+                if (c.contains(XRAY_VARYING) &&
+                    !c.contains("uniform vec4 g_PointerState;")) {
                     c = c.replace(XRAY_VARYING, XRAY_VARYING_REPLACEMENT)
                 }
-                if (Regex(XRAY_UNPROJECTED_SEARCH).containsMatchIn(c)) {
+                if (Regex(XRAY_UNPROJECTED_SEARCH).containsMatchIn(c) &&
+                    !c.contains(XRAY_UNPROJECTED_MARK)) {
                     c = Regex(XRAY_UNPROJECTED_SEARCH).replace(c, XRAY_UNPROJECTED_REPLACEMENT)
                 }
                 if (c.contains(XRAY_MVPINV) && XRAY_MVPINV_USE.containsMatchIn(c) &&
@@ -210,9 +231,16 @@ object PcShaderFixes {
         }
 
         // ── 3. per-line generic passes (std::getline semantics) ──
+        // v0.7.19 (APK ground truth): the PC's line loop PRESERVES the file's
+        // trailing-newline state. A file that does NOT end with '\n' gets its
+        // last line emitted WITHOUT a trailing '\n' (proof: the APK's
+        // volumetricsback.frag / flat.frag / flatpoint.frag / editorsprite.frag
+        // are 18/212/176/248 bytes, identical sizes to the PC originals — no
+        // byte added). A file that DOES end with '\n' keeps exactly one.
+        val endsWithNewline = c.isNotEmpty() && c.last() == '\n'
         val lines = c.split('\n').let { if (it.isNotEmpty() && it.last().isEmpty()) it.dropLast(1) else it }
         val out = StringBuilder(c.length + lines.size)
-        for (line in lines) {
+        for ((idx, line) in lines.withIndex()) {
             var l = line
             if (LOOP_LINE.containsMatchIn(l)) {
                 l = FOR_INT_SAMPLECOUNT.replace(l) { m ->
@@ -228,7 +256,9 @@ object PcShaderFixes {
                 l = CONST_INTC_SAMPLECOUNT.replace(l) { m -> m.groupValues[1] + "float" + m.groupValues[2] }
             }
             out.append(l)
-            out.append('\n')
+            // separator between lines, or the file's own trailing newline —
+            // never a newline the file didn't have
+            if (idx < lines.size - 1 || endsWithNewline) out.append('\n')
         }
         c = out.toString()
 

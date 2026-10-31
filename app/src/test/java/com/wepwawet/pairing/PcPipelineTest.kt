@@ -123,19 +123,31 @@ class PcPipelineTest {
 
     @Test
     fun `no trailing newline is added when the file has none`() {
-        // std::getline semantics: "a\nb" (no trailing \n) still re-emits with
-        // a final newline per line — "a\nb\n". The PC's output always ends
-        // with \n. (Verified against pulse.frag ground truth.)
+        // v0.7.19 (APK ground truth): the PC's line loop PRESERVES the file's
+        // trailing-newline state — the APK ships volumetricsback.frag /
+        // flat.frag / flatpoint.frag / editorsprite.frag at byte sizes
+        // IDENTICAL to the PC originals, so no newline is ever added. A file
+        // that DOES end with '\n' keeps exactly one (pulse.frag ground
+        // truth).
         val out = PcShaderFixes.fixShader("test", "float a = 1;")
-        assertEquals("float a = 1.0;\n", out)
+        assertEquals("float a = 1.0;", out)
+        val out2 = PcShaderFixes.fixShader("test", "float a = 1;\n")
+        assertEquals("float a = 1.0;\n", out2)
     }
 
     // ── name-gated patches ────────────────────────────────────────────────
 
     @Test
     fun `blur patch hoists only g_Texture0 before common_blur include`() {
+        // v0.7.19: the PC's blur-fix stage is VERIFIED DEAD CODE (its .rdata
+        // pattern carries a literal double backslash, so no real file can
+        // match) — fixShader leaves the bytes untouched and the ESSL safety
+        // pass performs the hoist the dead stage was designed for (the APK's
+        // own blur_k3.frag / editorpaintbrush.frag ship with it applied).
         val src = "#include \"common_blur.h\"\n\nuniform sampler2D g_Texture0; // {\"hidden\":true}\nuniform sampler2D g_Texture1;\n"
-        val out = PcShaderFixes.fixShader("blur_precise_gaussian", src)
+        val pcOut = PcShaderFixes.fixShader("blur_precise_gaussian", src)
+        assertEquals("the dead PC stage must not touch the file", src, pcOut)
+        val out = PcShaderFixes.fixShaderForMobile("blur_precise_gaussian", src)
         // The include line gains the uniform BEFORE it; the original
         // declaration is deleted. g_Texture1 stays where it was.
         assertTrue(out.contains("uniform sampler2D g_Texture0;\n#include \"common_blur.h\""))
