@@ -28,10 +28,9 @@
 #include <mutex>
 #include "etcpack_lib.h"
 
-extern "C" {
-// from etcpack.cxx (not in etcpack_lib.h)
+// C++ linkage (etcpack.cxx defines this without extern "C"; the NDK linker
+// resolves it eagerly, so the declaration must match exactly).
 void compressBlockAlphaFast(uint8 *data, int ix, int iy, int width, int height, uint8 *returnData);
-}
 
 namespace {
 
