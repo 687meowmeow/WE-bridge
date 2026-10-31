@@ -19,6 +19,8 @@ Files:
   etcdec.cxx     the decoder (used by roundtrip_test.cpp)
   etcimage.cxx   image container helpers (dependency of etcpack.cxx)
   etcpack_lib.h  public prototypes
+  sys/timeb.h    bionic compatibility shim (Android removed <sys/timeb.h>;
+                 only the CLI timing helpers use ftime())
   etcimage.h     image helpers header
   roundtrip_test.cpp  host-build verification: encodes known blocks and
                   decodes them with etcpack's own decoder (orientation,
