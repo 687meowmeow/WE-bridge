@@ -15,11 +15,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/etc2comp/EtcLib/Etc
     ${CMAKE_CURRENT_SOURCE_DIR}/etc2comp/EtcLib/EtcCodec
+    ${CMAKE_CURRENT_SOURCE_DIR}/etcpack
 )
 
 file(GLOB ETC_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/etc2comp/EtcLib/Etc/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/etc2comp/EtcLib/EtcCodec/*.cpp
+)
+
+# ============================================================================
+# etcpack — the ETC2 encoder Wallpaper Engine's resourcecompiler64.exe uses
+# (AMD Compressonator v3.x bundles Ericsson's etcpack; m_fast = true).
+# Byte-exact with the PC's ETC2 RGBA8 output. See etcpack_jni.cpp.
+# ============================================================================
+set(ETCPACK_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/etcpack/etcpack.cxx
+    ${CMAKE_CURRENT_SOURCE_DIR}/etcpack/etcdec.cxx
+    ${CMAKE_CURRENT_SOURCE_DIR}/etcpack/etcimage.cxx
+)
+# etcpack is vendored third-party code (Ericsson, via AMD Compressonator) —
+# silence its warnings; do not modify the algorithm.
+set_source_files_properties(${ETCPACK_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-w;-Wno-deprecated;"
 )
 
 # ============================================================================
@@ -29,6 +46,7 @@ set(JNI_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/etc2_jni.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dxt_jni.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dxt_decoder.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/etcpack_jni.cpp
 )
 
 # ============================================================================
@@ -112,6 +130,7 @@ endif()
 add_library(wepwawet_etc2 SHARED
     ${JNI_SOURCES}
     ${ETC_SOURCES}
+    ${ETCPACK_SOURCES}
 )
 
 # Compiler flags

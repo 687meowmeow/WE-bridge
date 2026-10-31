@@ -373,8 +373,8 @@ android {
         //   g_Texture2 (waterflowphase.tex) .r → flowPhase → smoothstep(0.2,0.8,
         //   flowPhase) → mix(flowAlbedo, flowAlbedo2, ...) — the .r channel
         //   MUST be precise for smooth animation.
-        versionCode = 109
-        versionName = "0.7.17-alpha"
+        versionCode = 110
+        versionName = "0.7.18-alpha"
         // Native ABI filter — only build for arm64-v8a (WE app targets Snapdragon 8 Gen 2+)
         ndk {
             abiFilters += "arm64-v8a"

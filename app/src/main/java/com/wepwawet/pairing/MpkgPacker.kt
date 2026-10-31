@@ -101,6 +101,23 @@ object MpkgPacker {
     var textureShrinkFactor: Int = 1
 
     // ══════════════════════════════════════════════════════════════════════
+    // v0.7.18 (PC parity — the `-c force` gate): wallpaperui appends
+    // " -c force" to the resourcecompiler64 command only when the .tex's
+    // parent path is materials/materials\masks AND the paired device's
+    // "compression" setting != "high_quality" (FUN_140019b80:
+    // `*out = (value != "high_quality")`, missing key ⇒ "" ⇒ forced).
+    //
+    // WepWawet defaults to the device-equivalent of "high_quality" (false) —
+    // the setting that produced the byte-verified reference .mpkg: DXT/BC
+    // sources still become ETC2, but PNG/RGBA sources keep lossless RGBA8888
+    // (exactly what the PC shipped for those textures). Enabling it mirrors
+    // the PC's "compressed" device option: every materials texture is forced
+    // to ETC2_RGBA8.
+    // ══════════════════════════════════════════════════════════════════════
+    @Volatile
+    var forceEtc2Compression: Boolean = false
+
+    // ══════════════════════════════════════════════════════════════════════
     // v0.7.4 (parity G9): video wallpaper alignment position. The PC writes
     // the device-configured alignment into project.json as
     // {"alignmentposition": {"value": <int>}} (FUN_14003d0e0, disasm
@@ -514,137 +531,117 @@ object MpkgPacker {
         for (texEntry in texSource) {
             val (name, blob) = texEntry
 
-            // Parse the .tex header FIRST. We route to the appropriate converter
-            // based on the TexI format field — this avoids the false-positive
-            // FFD8FF detection that triggered convertTexPngToEtc2 on DXT .tex files.
+            // ══════════════════════════════════════════════════════════════
+            // v0.7.18 (PC-exact): the .tex routing replicates what the PC's
+            // in-place `resourcecompiler64.exe -transcode -i X -o X -f ETC2
+            // [-c force] -shrink N -maxmipmaps 1` does to EVERY .tex of the
+            // transcoded project copy (wallpaperui 0x14003f884–0x14003f95d;
+            // the exit code is IGNORED — a texture the tool fails on keeps
+            // its original bytes and is packed unchanged):
             //
-            // TexI format values (per repkg's TexFormat enum — the authoritative source
-            // https://github.com/notscuffed/repkg):
-            //   0  = FIF_UNKNOWN (auto-detect via magic bytes — may contain PNG or JPEG)
-            //   4  = DXT5 (BC3)  → convertTexDxtToEtc2
-            //   5  = ETC2_RGBA8  → already mobile-compatible, SKIP conversion
-            //   6  = DXT3 (BC2)  → convertTexDxtToEtc2
-            //   7  = DXT1 (BC1)  → convertTexDxtToEtc2
-            //   8  = RG88        → convertTexRg88ToEtc2 (NEW v0.6.0 §6-2)
-            //   9  = R8          → convertTexR8ToEtc2 (NEW v0.6.0 §6-2)
-            //   11 = BC4 (RGTC1) → convertTexDxtToEtc2
-            //   12 = BC5 (RGTC2) → convertTexDxtToEtc2
-            //   13 = BC6H (HDR)  → convertTexDxtToEtc2 (NEW v0.6.0 §6-1/6-9)
-            //   14 = BC7         → convertTexDxtToEtc2 (NEW v0.6.0 §6-1/6-10)
-            //   20 = RGBA8888    → convertTexRgba8888ToEtc2 (NEW v0.6.0 §6-3, was pass-through)
-            //
-            // v0.6.0 (parity §6 6-1): CRITICAL FIX — format codes 13 and 14 are BC6H and BC7
-            // respectively, NOT FIF_PNG/FIF_JPEG as previously documented. PNG/JPEG-encoded
-            // .tex files have TexI format=0 (FIF_UNKNOWN) and are detected via magic bytes.
-            val texHeader = parseTexHeader(blob)
-            val texiFormat = texHeader?.first ?: -1
-            val isLz4 = texHeader?.second ?: false
+            //   • format 8 (RG88) / 9 (R8)               → copied verbatim
+            //   • imageCount > 1 (animated/spritesheet)  → copied verbatim
+            //   • TEXI flags & 0x20                      → copied verbatim
+            //   • format 1 (RGB888) without -c force     → copied verbatim
+            //   • formats the tool cannot handle (5 = ETC2, 11, 13, 14,
+            //     20, anything else)                     → original bytes ship
+            //   • handled: 0 (RGBA8888 incl. PNG/JPEG bodies), 4 (DXT5),
+            //     6 (DXT3), 7 (DXT1), 12 (BC7):
+            //       – DXT/BC sources  → ETC2_RGBA8 via etcpack, padded dims
+            //       – format 0 sources → RGBA8888 (ETC2 only with -c force)
+            //       – LZ4 only above 16383 bytes, kept only under 0.95 ratio
+            //       – flags: bit 30 stripped; 0x08 OR-ed when stored raw
+            //       – single mip; TEXS section preserved after the body
+            // ══════════════════════════════════════════════════════════════
+            val texInfo = PcTexTranscoder.parse(blob)
+            val texiFormat = texInfo?.texiFormat ?: -1
 
-            // Log .tex header info for debugging
-            WepWawetLogger.proxyDebug("MpkgPacker.packFromPkg: .tex header",
-                "name" to name, "texi_format" to texiFormat,
-                "is_lz4" to isLz4, "tex_size" to blob.size)
+            // ---- The verbatim-passthrough rules ----
+            val pcCopyThrough = texInfo == null ||
+                texiFormat == 8 || texiFormat == 9 ||
+                (texInfo.imageCount > 1) ||
+                (texInfo.flags and 0x20) != 0 ||
+                (texiFormat == 1 && !forceEtc2Compression)
 
-            // ---- Branch 1: format=5 (ETC2_RGBA8) — already mobile-compatible ----
-            if (texiFormat == 5) {
-                WepWawetLogger.proxy("MpkgPacker.packFromPkg: .tex is ETC2 (format=5) — already mobile-compatible, skipping conversion",
-                    "name" to name, "tex_size" to blob.size, "is_lz4" to isLz4)
+            // ---- The formats the PC tool errors on (original bytes ship) ----
+            val pcErrorsOnIt = !pcCopyThrough &&
+                texiFormat != 0 && texiFormat != 1 &&
+                texiFormat !in PcTexTranscoder.DXT_SOURCE_FORMATS
+
+            if (texInfo != null) {
+                WepWawetLogger.proxyDebug("MpkgPacker.packFromPkg: .tex header",
+                    "name" to name, "texi_format" to texiFormat,
+                    "image_count" to texInfo.imageCount,
+                    "flags" to "0x%02x".format(texInfo.flags),
+                    "is_lz4" to texInfo.bodyIsLz4, "tex_size" to blob.size,
+                    "pc_copy_through" to pcCopyThrough,
+                    "pc_errors" to pcErrorsOnIt,
+                    "etc2_source" to (texiFormat in PcTexTranscoder.DXT_SOURCE_FORMATS))
+            }
+
+            if (pcCopyThrough) {
+                WepWawetLogger.proxy("MpkgPacker.packFromPkg: .tex passes through unchanged (PC rule)",
+                    "name" to name, "texi_format" to texiFormat, "tex_size" to blob.size,
+                    "reason" to when {
+                        texInfo == null -> "unparseable header"
+                        texiFormat == 8 || texiFormat == 9 -> "RG88/R8 (format $texiFormat)"
+                        texInfo.imageCount > 1 -> "animated/multi-image (imageCount=${texInfo.imageCount})"
+                        (texInfo.flags and 0x20) != 0 -> "TEXI flag 0x20"
+                        texiFormat == 1 -> "RGB888 without -c force"
+                        else -> "?"
+                    })
+                processedEntries.add(texEntry)
+                continue
+            }
+            if (pcErrorsOnIt) {
+                // The PC's tool exits nonzero on these; wallpaperui ignores
+                // the exit code and the ORIGINAL file is what lands in the
+                // .mpkg. Verified against a real PC-produced .mpkg: RG88/R8
+                // masks and ETC2 textures ship byte-identical to the .pkg.
+                WepWawetLogger.proxy("MpkgPacker.packFromPkg: .tex not handled by the PC tool — original bytes ship (PC rule)",
+                    "name" to name, "texi_format" to texiFormat, "tex_size" to blob.size)
                 processedEntries.add(texEntry)
                 continue
             }
 
-            // ---- Branch 2: format=20 (RGBA8888) — the PC's resourcecompiler pipeline ----
-            // v0.7.16 (PC-exact): same decision tree as format=0 — decode the
-            // RGBA body, then ETC2 when the image is huge, otherwise RGBA with
-            // LZ4 when it saves ≥25% (raw + flags|=0x08 otherwise).
-            if (texiFormat == 20) {
-                val converted = convertFormat0TexPc(blob, name)
-                if (converted != null) {
-                    processedEntries.add(Pair(name, converted))
-                    texConverted++
-                    texRgbaConverted++
-                    totalOriginalTexBytes += blob.size
-                    totalConvertedTexBytes += converted.size
-                } else {
-                    processedEntries.add(texEntry)
-                    WepWawetLogger.proxyWarn("MpkgPacker.packFromPkg: RGBA8888 .tex conversion FAILED — using original",
-                        "name" to name)
-                }
-                continue
-            }
-
-            // ---- Branch 3: DXT/BC family — transcode via DxtDecoder ----
-            // v0.6.0: Now includes BC6H (13) and BC7 (14)
+            // ---- The transcoded formats: 0, 1 (forced), 4, 6, 7, 12 ----
             val dxtFormat = DxtDecoder.formatForTexFormat(texiFormat)
+            val converted: ByteArray?
             if (dxtFormat != null) {
-                WepWawetLogger.proxy("MpkgPacker.packFromPkg: .tex is ${dxtFormat.displayName} (format=$texiFormat) — transcoding → ETC2_RGBA8+LZ4",
-                    "name" to name,
-                    "tex_size" to blob.size,
-                    "is_lz4" to isLz4)
-                val converted = convertTexDxtToEtc2(blob, name)
+                WepWawetLogger.proxy("MpkgPacker.packFromPkg: .tex is ${dxtFormat.displayName} (format=$texiFormat) — PC: decode → etcpack ETC2",
+                    "name" to name, "tex_size" to blob.size, "is_lz4" to (texInfo?.bodyIsLz4 ?: false))
+                converted = convertTexDxtToEtc2(blob, name)
                 if (converted != null) {
                     processedEntries.add(Pair(name, converted))
                     texConverted++
                     texDxtConverted++
                     totalOriginalTexBytes += blob.size
                     totalConvertedTexBytes += converted.size
-                    WepWawetLogger.proxy("MpkgPacker.packFromPkg: DXT/BC .tex transcoded",
-                        "name" to name,
-                        "dxt_format" to dxtFormat.displayName,
-                        "original_size" to blob.size,
-                        "converted_size" to converted.size,
-                        "size_ratio" to "%.2fx".format(converted.size.toDouble() / blob.size.toDouble()))
                 } else {
                     processedEntries.add(texEntry)
-                    WepWawetLogger.proxyWarn("MpkgPacker.packFromPkg: DXT/BC .tex transcode FAILED — using original (will show yellow/black on Android)",
-                        "name" to name,
-                        "dxt_format" to dxtFormat.displayName)
+                    WepWawetLogger.proxyWarn("MpkgPacker.packFromPkg: DXT/BC .tex transcode FAILED — using original (matches the PC's ignored exit code)",
+                        "name" to name, "dxt_format" to dxtFormat.displayName)
                 }
                 continue
             }
 
-            // ---- Branch 4: format=8 (RG88) / format=9 (R8) — pass through ----
-            // v0.7.16 (PC-exact): the real PC transcoder runs
-            // resourcecompiler64.exe on EVERY materials .tex, and the tool
-            // leaves RG88/R8 formats untouched — a real PC-produced .mpkg
-            // ships the masks byte-identical to the .pkg (verified against
-            // the WORKING mpkg: materials/masks/*.tex all format=8/9,
-            // byte-for-byte identical). The v0.6.0 ETC2 conversion of these
-            // formats was wrong (it only "worked" when the converter failed
-            // and fell through to passthrough) and is now removed.
-            if (texiFormat == 8 || texiFormat == 9) {
-                WepWawetLogger.proxy("MpkgPacker.packFromPkg: .tex is RG88/R8 (format=$texiFormat) — PC passes through unchanged",
-                    "name" to name, "tex_size" to blob.size, "is_lz4" to isLz4)
-                processedEntries.add(texEntry)
-                continue
-            }
-
-            // ---- Branch 5: format=0 (FIF_UNKNOWN) — the PC's resourcecompiler pipeline ----
-            // v0.7.16 (PC-exact): decoded to RGBA (PNG/JPEG body decoded at the
-            // image's intrinsic size, LZ4 body decompressed, raw body as-is),
-            // then:
-            //   • max(w,h) > 2048  → ETC2_RGBA8 + LZ4            (format=5)
-            //   • else RGBA8888 + LZ4 when it saves ≥20%         (format=0, isLz4=1)
-            //   • else RGBA8888 raw, flags |= 0x08               (format=0, isLz4=0)
-            // Output header is always normalized to TEXB0004 with texbFormat=-1,
-            // a single mip, and tex dims = image dims (the PC un-pads 2048×512
-            // tex headers down to the real image size).
-            // Verified byte-for-byte against a real PC-produced .mpkg
-            // (waterflowphase, waterripplenormal, HD-thumb, icon,
-            // output-onlinepngtools, MSK — all six format=0 textures).
+            // ---- format 0 (RGBA8888, incl. PNG/JPEG bodies) / forced RGB888 ----
+            // PC pipeline: decode to RGBA at the image's intrinsic size
+            // (PNG/JPEG body decoded, LZ4 body decompressed, raw body as-is),
+            // apply -shrink, then RGBA8888 out (ETC2 only with -c force).
             run {
-                val converted = convertFormat0TexPc(blob, name)
-                if (converted != null) {
-                    processedEntries.add(Pair(name, converted))
+                val result = convertFormat0TexPc(blob, name)
+                if (result != null) {
+                    processedEntries.add(Pair(name, result))
                     texConverted++
-                    if (PcTexTranscoder.parse(converted)?.texiFormat == 5) texPngConverted++
+                    if (PcTexTranscoder.parse(result)?.texiFormat == 5) texPngConverted++
                     else texRgbaConverted++
                     totalOriginalTexBytes += blob.size
-                    totalConvertedTexBytes += converted.size
+                    totalConvertedTexBytes += result.size
                 } else {
                     processedEntries.add(texEntry)
-                    WepWawetLogger.proxyWarn("MpkgPacker.packFromPkg: format=0 .tex conversion FAILED — using original (may not load on Android)",
-                        "name" to name, "texi_format" to texiFormat, "is_lz4" to isLz4)
+                    WepWawetLogger.proxyWarn("MpkgPacker.packFromPkg: format=0 .tex conversion FAILED — using original (matches the PC's ignored exit code)",
+                        "name" to name, "texi_format" to texiFormat, "is_lz4" to (texInfo?.bodyIsLz4 ?: false))
                 }
             }
         }
@@ -2126,414 +2123,6 @@ object MpkgPacker {
             return null
         }
     }
-
-    /**
-     * Convert a .tex file containing PNG data to ETC2 RGBA8 + LZ4 format.
-     *
-     * This is the production-grade conversion that matches what WE PC's
-     * `resourcecompiler64.exe -transcode -f ETC2` does for mobile packaging.
-     *
-     * Pipeline:
-     *   1. Parse .tex structure to find all PNG images (mipmap levels)
-     *   2. Decode the LARGEST PNG (mipmap level 0) → RGBA8888 using Android's
-     *      BitmapFactory with `inPremultiplied = false` (preserves non-premultiplied
-     *      alpha so X-ray shader reads correct mask.rgb values)
-     *   3. Encode RGBA8888 → ETC2 RGBA8 using native library (libwepwawet_etc2.so)
-     *      built from Google's etc2comp source
-     *   4. LZ4-compress the ETC2 RGBA8 bytes using lz4-java library
-     *   5. Write new .tex with format=5 (ETC2 RGBA8), compression=1 (LZ4),
-     *      dimensions matching the PNG (so scene.json's autosize matches)
-     *
-     * Result: ~5x smaller than original PNG (matches real WE Android .tex files)
-     * For 3000x1800 RGBA: 21.6 MB raw → 5.4 MB ETC2 → ~250 KB-2 MB LZ4
-     *
-     * If the ETC2 native library fails to load, falls back to the old
-     * raw RGBA8888 conversion (which produces larger files but still works).
-     */
-    private fun convertTexPngToEtc2(texData: ByteArray, name: String): ByteArray? {
-        // Try ETC2 path first
-        try {
-            // ---- Cache lookup ----
-            texCacheLookup(texData, name)?.let { cached ->
-                WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: using cached conversion",
-                    "name" to name, "cached_size" to cached.size)
-                return cached
-            }
-
-            // Check if ETC2 native encoder is available
-            if (!Etc2Encoder.isAvailable()) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexPngToEtc2: native ETC2 encoder not available, falling back to RGBA8888",
-                    "name" to name)
-                return convertTexPngToRgba(texData, name)
-            }
-
-            // ---- Step 1: Parse original .tex structure to find embedded images ----
-            // .tex files from Steam depot may contain PNG or JPEG image data.
-            // PNG: starts with \x89PNG, ends with IEND chunk + CRC (8 bytes).
-            // JPEG: starts with FF D8 FF, ends with FF D9 (EOI marker, 2 bytes).
-            data class ImageEntry(val offset: Int, val end: Int, val bytes: ByteArray, val format: String)
-            val embeddedImages = mutableListOf<ImageEntry>()
-            var searchPos = 0
-            // Search for PNG images first
-            while (true) {
-                val pngStart = findBytes(texData, PNG_MAGIC, searchPos)
-                if (pngStart < 0) break
-                // v0.7.4: chunk-structure walk to find the TRUE PNG end (see
-                // findPngEnd) — a raw "IEND" byte search could match the literal
-                // text inside a tEXt chunk and truncate the image.
-                val pngEnd = findPngEnd(texData, pngStart)
-                if (pngEnd < 0) break
-                val pngBytes = texData.copyOfRange(pngStart, pngEnd)
-                embeddedImages.add(ImageEntry(pngStart, pngEnd, pngBytes, "PNG"))
-                searchPos = pngEnd
-            }
-            // If no PNG found, search for JPEG images
-            if (embeddedImages.isEmpty()) {
-                searchPos = 0
-                while (true) {
-                    val jpgStart = findBytes(texData, JPEG_MAGIC, searchPos)
-                    if (jpgStart < 0) break
-                    // Validate that this is actually JPEG (not a false positive).
-                    // FFD8FF can appear in binary .tex data (DXT textures, LZ4-compressed
-                    // data, etc.) by coincidence. Check that the 4th byte (the marker type
-                    // after SOI) is a valid JPEG marker.
-                    if (jpgStart + 3 >= texData.size) { searchPos = jpgStart + 3; continue }
-                    val markerByte = texData[jpgStart + 3]
-                    if (!isValidJpegMarker(markerByte)) {
-                        WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: FFD8FF found but marker byte invalid — false positive, skipping",
-                            "name" to name, "jpg_start" to jpgStart,
-                            "marker_byte" to "0x%02x".format(markerByte))
-                        searchPos = jpgStart + 3
-                        continue
-                    }
-                    // CRITICAL: Do NOT search for the JPEG EOI marker (FF D9) to
-                    // determine the JPEG's end. The EXIF data in many JPEGs (including
-                    // the Mordred V2 wallpaper) contains a THUMBNAIL JPEG image which
-                    // has its own FF D8 FF ... FF D9 sequence. Searching for FF D9 from
-                    // the JPEG start would find the thumbnail's EOI, producing a
-                    // truncated JPEG that BitmapFactory.decodeByteArray returns null for.
-                    //
-                    // Instead, pass the ENTIRE remaining .tex file data from the JPEG
-                    // SOI marker to the end. BitmapFactory is smart enough to find the
-                    // real EOI marker of the MAIN image and ignore any trailing data
-                    // (including the thumbnail, padding, and next mipmap's data).
-                    val jpgEnd = texData.size
-                    val jpgBytes = texData.copyOfRange(jpgStart, jpgEnd)
-                    embeddedImages.add(ImageEntry(jpgStart, jpgEnd, jpgBytes, "JPEG"))
-                    WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: JPEG found, using entire remaining .tex data",
-                        "name" to name, "jpg_start" to jpgStart, "jpg_end" to jpgEnd,
-                        "jpg_bytes" to jpgBytes.size,
-                        "first_8_bytes_hex" to jpgBytes.take(8).joinToString("") { "%02x".format(it) })
-                    break
-                }
-            }
-
-            if (embeddedImages.isEmpty()) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexPngToEtc2: no PNG or JPEG images found",
-                    "name" to name)
-                return convertTexPngToRgba(texData, name)
-            }
-
-            // ---- Step 2: Decode the LARGEST image (mipmap level 0) to RGBA8888 ----
-            // Use mipmap level 0 (full size) — ETC2 + LZ4 will reduce file size
-            // enough that we can afford the full resolution. Also, mipmap level 0's
-            // dimensions MUST match what scene.json expects (otherwise autosize
-            // shrinks the model to a "small box in the center" — bug from v0.2.6).
-            // BitmapFactory can decode both PNG and JPEG.
-            data class DecodedRgba(val imgIndex: Int, val width: Int, val height: Int, val rgba: ByteArray)
-            val decoded = mutableListOf<DecodedRgba>()
-            for ((idx, imgEntry) in embeddedImages.withIndex()) {
-                // v0.6.0 (parity §6-11): Multi-page image support (animated GIF / animated WebP).
-                // Previously only the first frame was decoded via BitmapFactory. WE PC uses
-                // FreeImage's LoadMultiBitmapFromMemory + LockPage + GetPageCount for these.
-                // We now detect animated images via Movie API and decode all frames.
-                val isAnimatedGif = imgEntry.format == "PNG" &&
-                    imgEntry.bytes.size > 12 &&
-                    // GIF89a header for animated GIFs (despite the .tex using PNG format internally,
-                    // some Workshop wallpapers actually contain GIF data mislabeled as PNG)
-                    imgEntry.bytes[0] == 0x47.toByte() && imgEntry.bytes[1] == 0x49.toByte() &&
-                    imgEntry.bytes[2] == 0x46.toByte()  // "GIF"
-
-                if (isAnimatedGif) {
-                    // Use android.graphics.Movie to decode all frames of the animated GIF
-                    try {
-                        val movie = android.graphics.Movie.decodeByteArray(imgEntry.bytes, 0, imgEntry.bytes.size)
-                        if (movie != null && movie.duration() > 0) {
-                            // Movie.duration() returns total duration in ms; assume 100ms per frame
-                            val frameCount = (movie.duration() / 100).coerceAtLeast(1)
-                            WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: animated GIF detected",
-                                "name" to name, "duration_ms" to movie.duration(),
-                                "estimated_frames" to frameCount,
-                                "width" to movie.width(), "height" to movie.height())
-                            // Decode each frame as a Bitmap and add to decoded list
-                            val canvasBitmap = android.graphics.Bitmap.createBitmap(
-                                movie.width(), movie.height(), android.graphics.Bitmap.Config.ARGB_8888)
-                            val canvas = android.graphics.Canvas(canvasBitmap)
-                            for (frameIdx in 0 until frameCount) {
-                                canvasBitmap.eraseColor(android.graphics.Color.TRANSPARENT)
-                                val movieTime = (frameIdx * 100L).toInt()
-                                movie.setTime(movieTime)
-                                movie.draw(canvas, 0f, 0f)
-                                // Extract pixels from canvas
-                                val pixelBuffer = java.nio.ByteBuffer.allocateDirect(
-                                    movie.width() * movie.height() * 4)
-                                    .order(java.nio.ByteOrder.nativeOrder())
-                                canvasBitmap.copyPixelsToBuffer(pixelBuffer)
-                                val rgbaTopDown = ByteArray(movie.width() * movie.height() * 4)
-                                pixelBuffer.rewind()
-                                pixelBuffer.get(rgbaTopDown)
-                                decoded.add(DecodedRgba(idx, movie.width(), movie.height(), rgbaTopDown))
-                            }
-                            canvasBitmap.recycle()
-                            continue  // Skip the single-frame decode below
-                        }
-                    } catch (e: Exception) {
-                        WepWawetLogger.proxyWarn("MpkgPacker.convertTexPngToEtc2: animated GIF decode failed — falling back to single frame",
-                            "name" to name, "exception" to e.javaClass.name)
-                    }
-                }
-
-                val options = android.graphics.BitmapFactory.Options().apply {
-                    inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
-                    inPremultiplied = false  // CRITICAL for X-ray mask textures
-                }
-                val bitmap = android.graphics.BitmapFactory.decodeByteArray(
-                    imgEntry.bytes, 0, imgEntry.bytes.size, options)
-                if (bitmap == null) {
-                    WepWawetLogger.proxyWarn("MpkgPacker.convertTexPngToEtc2: BitmapFactory returned null",
-                        "name" to name, "img_index" to idx, "format" to imgEntry.format)
-                    continue
-                }
-                val rgbaBitmap = if (bitmap.config == android.graphics.Bitmap.Config.ARGB_8888) {
-                    bitmap
-                } else {
-                    val copy = bitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
-                    bitmap.recycle()
-                    copy
-                } ?: continue
-
-                val w = rgbaBitmap.width
-                val h = rgbaBitmap.height
-                val pixelBuffer = java.nio.ByteBuffer.allocateDirect(w * h * 4)
-                    .order(java.nio.ByteOrder.nativeOrder())
-                rgbaBitmap.copyPixelsToBuffer(pixelBuffer)
-                rgbaBitmap.recycle()
-
-                // === TEXTURE ORIENTATION — NO FLIP (v0.4.3) ===
-                //
-                // History:
-                //  - v0.3.1-alpha: flipped PNG → ETC2 vertically. Result: textures
-                //    appeared UPSIDE-DOWN on WE Android (the character image was
-                //    rendered head-down, the "D a y" text appeared at the top of
-                //    the screen instead of the bottom).
-                //  - v0.3.2-alpha: REVERTED the flip. Result: textures appeared
-                //    RIGHT-SIDE-UP. This is the correct orientation.
-                //  - v0.4.2-alpha: re-added the flip (thinking OpenGL's bottom-up
-                //    convention required it). Result: textures appeared UPSIDE-DOWN
-                //    again (user reported "the image is now fully upside down again").
-                //
-                // Conclusion: WE Android's texture loading pipeline already handles
-                // the orientation correctly when ETC2 blocks are encoded in TOP-DOWN
-                // order (matching the PNG's natural row order). The flip is NOT
-                // needed and actually breaks rendering.
-                //
-                // The previous analysis about "OpenGL expects bottom-up" was wrong
-                // for the WE Android case: WE Android likely uses
-                // glPixelStorei(GL_UNPACK_FLIP_Y) or samples textures with V=1-V
-                // internally, which compensates for the top-down encoding.
-                //
-                // The "D a y" text being upside down (which the user reported in
-                // v0.4.1) is NOT caused by texture orientation — it's a separate
-                // WE Android text-rendering issue (the text glyphs are rendered to
-                // a font texture, which uses a different rendering path that we
-                // can't fix from the .mpkg side).
-                //
-                // Decision: use the top-down RGBA buffer AS-IS, no flip.
-                val rgbaTopDown = ByteArray(w * h * 4)
-                pixelBuffer.rewind()
-                pixelBuffer.get(rgbaTopDown)
-                val rgba = rgbaTopDown
-                WepWawetLogger.proxyDebug("MpkgPacker.convertTexPngToEtc2: RGBA buffer (no flip — v0.4.3)",
-                    "name" to name, "width" to w, "height" to h,
-                    "first_pixel_rgba" to
-                        "(${rgba[0].toInt() and 0xFF},${rgba[1].toInt() and 0xFF},${rgba[2].toInt() and 0xFF},${rgba[3].toInt() and 0xFF})")
-                decoded.add(DecodedRgba(idx, w, h, rgba))
-
-                WepWawetLogger.proxyDebug("MpkgPacker.convertTexPngToEtc2: decoded PNG",
-                    "name" to name, "png_index" to idx,
-                    "width" to w, "height" to h, "rgba_size" to rgba.size)
-            }
-
-            if (decoded.isEmpty()) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexPngToEtc2: no PNGs decoded",
-                    "name" to name)
-                return convertTexPngToRgba(texData, name)
-            }
-
-            // Pick the largest mipmap (level 0) — texture dimensions MUST match scene.json
-            val largestRaw = decoded.maxByOrNull { it.width.toLong() * it.height.toLong() }!!
-            // v0.7.4 (parity G5): apply the optional texture shrink (PC
-            // "texturereduction") — both the ETC2 data and the .tex header
-            // dims written below then reflect the reduced resolution.
-            val largest = maybeShrinkRgba(largestRaw.rgba, largestRaw.width, largestRaw.height, name)
-                ?.let { DecodedRgba(largestRaw.imgIndex, it.second, it.third, it.first) }
-                ?: largestRaw
-            WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: selected mipmap (largest, must match scene.json)",
-                "name" to name, "selected_index" to largest.imgIndex,
-                "width" to largest.width, "height" to largest.height,
-                "rgba_bytes" to largest.rgba.size,
-                "shrunk" to (largest !== largestRaw))
-
-            // ---- Step 3: Encode RGBA8888 → ETC2 RGBA8 (via native library) ----
-            // v0.6.0 (parity §6 6-7): Detect opacity for RGBX error metric
-            var pngIsOpaque = true
-            val pngSampleStep = 4 * 1024
-            var pngI = 3
-            while (pngI < largest.rgba.size) {
-                if ((largest.rgba[pngI].toInt() and 0xFF) != 255) {
-                    pngIsOpaque = false
-                    break
-                }
-                pngI += pngSampleStep
-            }
-
-            val etc2EncodeStartMs = System.currentTimeMillis()
-            val etc2Bytes = try {
-                Etc2Encoder.encodeRgba8888(largest.rgba, largest.width, largest.height, pngIsOpaque)
-            } catch (e: Exception) {
-                WepWawetLogger.proxyError("MpkgPacker.convertTexPngToEtc2: native ETC2 encoding failed, falling back to RGBA8888",
-                    "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-                return convertTexPngToRgba(texData, name)
-            }
-            val etc2ElapsedMs = System.currentTimeMillis() - etc2EncodeStartMs
-            logEtc2Timing(name, largest.width, largest.height, etc2ElapsedMs)
-
-            // Expected size: blocks_x * blocks_y * 16
-            val blocksX = (largest.width + 3) / 4
-            val blocksY = (largest.height + 3) / 4
-            val expectedEtc2Size = blocksX * blocksY * 16
-            WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: ETC2 encoded",
-                "name" to name, "etc2_size" to etc2Bytes.size,
-                "expected" to expectedEtc2Size,
-                "compression_ratio" to "%.2f%%".format(etc2Bytes.size.toDouble() * 100 / largest.rgba.size))
-
-            // ---- Step 4: LZ4-compress the ETC2 bytes ----
-            // Use raw LZ4 block format (no size prefix — uncompressed_size is in .tex header)
-            //
-            // CRITICAL: LZ4 is REQUIRED — compression=1 (LZ4) is what the WE Android
-            // renderer expects for ETC2 RGBA8 .tex files. Falling back to compression=0
-            // (uncompressed ETC2) produces a .tex the renderer does NOT decode correctly
-            // (results in a black or corrupted wallpaper on the phone).
-            //
-            // LZ4Factory.safeInstance() uses Class.forName internally to load
-            // LZ4JavaSafeCompressor. The proguard-rules.pro LZ4 keep block
-            // (`-keep class net.jpountz.lz4.** { *; }` etc.) MUST be present or R8
-            // strips the class and Class.forName throws ClassNotFoundException wrapped
-            // in AssertionError. If that ever happens, DO NOT silently fall back —
-            // let it propagate so the user sees the real error and we fix the
-            // proguard rules instead of producing broken wallpapers.
-            val lz4Factory = net.jpountz.lz4.LZ4Factory.safeInstance()
-            val compressor = lz4Factory.fastCompressor()
-            val lz4Compressed = compressor.compress(etc2Bytes)
-            WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2: LZ4 compressed",
-                "name" to name,
-                "etc2_size" to etc2Bytes.size, "lz4_size" to lz4Compressed.size,
-                "lz4_ratio" to "%.2f%%".format(lz4Compressed.size.toDouble() * 100 / etc2Bytes.size))
-
-            // ---- Step 5: Read original TEXI header fields (preserve flags + UnkInt0) ----
-            if (texData.size < 46) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexPngToEtc2: .tex too small for header",
-                    "name" to name, "tex_size" to texData.size)
-                return convertTexPngToRgba(texData, name)
-            }
-            val origFlags = readLeInt(texData, 22)
-            val origUnkInt0 = readLeInt(texData, 42)
-
-            // ---- Step 6: Build new .tex with format=5, compression=1, ETC2+LZ4 ----
-            val out = java.io.ByteArrayOutputStream()
-
-            // 6a: Magic1 + Magic2 (18 bytes, preserved from original)
-            out.write(texData, 0, 18)
-
-            // 6b: TEXI Header (28 bytes = 7 × int32 LE)
-            // format=5 (ETC2 RGBA8) — matches real WE Android .tex files
-            writeLeIntToStream(out, 5)                              // format = 5 (ETC2 RGBA8)
-            writeLeIntToStream(out, origFlags)                      // flags (preserved)
-            writeLeIntToStream(out, largest.width)                 // texture_width = PNG width
-            writeLeIntToStream(out, largest.height)                // texture_height = PNG height
-            writeLeIntToStream(out, largest.width)                // image_width = PNG width
-            writeLeIntToStream(out, largest.height)               // image_height = PNG height
-            writeLeIntToStream(out, origUnkInt0)                    // UnkInt0 (preserved)
-
-            // 6c: TEXB Container header
-            out.write(byteArrayOf(
-                0x54, 0x45, 0x58, 0x42,  // "TEXB"
-                0x30, 0x30, 0x30, 0x34,  // "0004"
-                0x00                     // null terminator
-            ))
-            writeLeIntToStream(out, 1)                              // image_count = 1
-            writeLeIntToStream(out, -1)                             // format = -1 (FIF_UNKNOWN)
-            writeLeIntToStream(out, 0)                             // is_video_mp4 = 0
-
-            // 6d: Image 0
-            writeLeIntToStream(out, 1)                              // mipmap_count = 1
-
-            // 6e: Mipmap 0 with ETC2 RGBA8 + LZ4 compression (compression=1 is REQUIRED)
-            writeLeIntToStream(out, largest.width)                 // width
-            writeLeIntToStream(out, largest.height)                // height
-            writeLeIntToStream(out, 1)                              // compression = 1 (LZ4)
-            writeLeIntToStream(out, etc2Bytes.size)                // uncompressed_size
-            writeLeIntToStream(out, lz4Compressed.size)            // compressed_size
-            out.write(lz4Compressed)                                // LZ4-compressed ETC2 RGBA8 data
-
-            val result = out.toByteArray()
-
-            // ---- Step 7: Verify by reading back the structure ----
-            val vMagic1 = String(result, 0, 8, Charsets.US_ASCII)
-            val vMagic2 = String(result, 9, 8, Charsets.US_ASCII)
-            val vFormat = readLeInt(result, 18)
-            val vTexW = readLeInt(result, 26)
-            val vTexH = readLeInt(result, 30)
-            val vFIF = readLeInt(result, 59)
-            val vMipmapCount = readLeInt(result, 67)
-            val vMipmapW = readLeInt(result, 71)
-            val vMipmapH = readLeInt(result, 75)
-            val vCompression = readLeInt(result, 79)
-            val vUncompSize = readLeInt(result, 83)
-            val vCompSize = readLeInt(result, 87)
-            WepWawetLogger.proxy("MpkgPacker.convertTexPngToEtc2 SUCCESS",
-                "name" to name,
-                "original_size" to texData.size,
-                "converted_size" to result.size,
-                "png_count" to embeddedImages.size,  // actually PNG+JPEG count
-                "selected_width" to largest.width,
-                "selected_height" to largest.height,
-                "rgba_size" to largest.rgba.size,
-                "etc2_size" to etc2Bytes.size,
-                "lz4_size" to lz4Compressed.size,
-                // Verification
-                "verify_magic1" to vMagic1, "verify_magic2" to vMagic2,
-                "verify_format" to vFormat, "verify_texture_width" to vTexW,
-                "verify_texture_height" to vTexH, "verify_fif" to vFIF,
-                "verify_mipmap_count" to vMipmapCount,
-                "verify_mipmap_width" to vMipmapW, "verify_mipmap_height" to vMipmapH,
-                "verify_compression" to vCompression,
-                "verify_uncompressed_size" to vUncompSize,
-                "verify_compressed_size" to vCompSize,
-                "verify_data_starts_at" to 91,
-                "verify_first_8_bytes_hex" to (if (result.size >= 99) result.copyOfRange(91, 99).joinToString("") { "%02x".format(it) } else "file_too_small"))
-
-            // ---- Store result in texture conversion cache ----
-            texCacheStore(texData, result, name)
-
-            return result
-        } catch (e: Exception) {
-            WepWawetLogger.proxyError("MpkgPacker.convertTexPngToEtc2 FAILED — falling back to RGBA8888",
-                "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-            return convertTexPngToRgba(texData, name)
-        }
-    }
-
     /**
      * Convert a DXT-format .tex file (PC texture format) to ETC2_RGBA8 + LZ4.
      *
@@ -2830,19 +2419,11 @@ object MpkgPacker {
                 "first_pixel_rgba" to
                     "(${rgbaBytes[0].toInt() and 0xFF},${rgbaBytes[1].toInt() and 0xFF},${rgbaBytes[2].toInt() and 0xFF},${rgbaBytes[3].toInt() and 0xFF})")
 
-            // ---- Step 5: Encode RGBA8888 → ETC2_RGBA8 (via native library) ----
-            // v0.6.0 (parity §6 6-4 + 6-7): Detect DXT1 vs DXT1a (use1BitAlpha) for
-            // the decoder call, and detect opacity for the ETC2 encoder error metric.
-            //
-            // For DXT1: use the .tex flags field's bit 3 (HasAlpha = 0x08) to decide
-            //   - flags & 0x08 set → DXT1a (1-bit alpha mode)
-            //   - flags & 0x08 unset → DXT1 (4-color opaque)
-            //
-            // For DXT3/DXT5/BC4/BC5/BC6H/BC7: use1BitAlpha doesn't matter (only affects DXT1).
+            // ---- Step 5 (v0.7.18, PC-exact): decode → shrink → etcpack ETC2 ----
+            // For DXT1: the .tex flags bit 3 (0x08) selects DXT1a (1-bit alpha)
+            // vs plain DXT1 (4-color opaque) for the DECODER only.
             val hasAlphaFlag = (origFlags and 0x08) != 0
             val use1BitAlphaForDxt1 = if (dxtFormat == DxtDecoder.Format.DXT1) hasAlphaFlag else true
-
-            // Re-decode with proper use1BitAlpha if DXT1
             val rgbaBytesFinal = if (dxtFormat == DxtDecoder.Format.DXT1 && !use1BitAlphaForDxt1) {
                 WepWawetLogger.proxy("MpkgPacker.convertTexDxtToEtc2: re-decoding DXT1 as opaque (no HasAlpha flag)",
                     "name" to name, "flags" to origFlags)
@@ -2852,193 +2433,66 @@ object MpkgPacker {
                 rgbaBytes
             }
 
-            // Detect opacity for ETC2 encoder (RGBX metric for opaque)
-            var isOpaque = true
-            val sampleStep = 4 * 1024
-            var i = 3
-            while (i < rgbaBytesFinal.size) {
-                if ((rgbaBytesFinal[i].toInt() and 0xFF) != 255) {
-                    isOpaque = false
-                    break
-                }
-                i += sampleStep
-            }
-
-            // v0.7.4 (parity G5): apply the optional texture shrink BEFORE the
-            // encode — the ETC2 data AND every .tex header dimension below
-            // then reflect the reduced resolution (PC "texturereduction").
+            // -shrink (PC rule: only when BOTH dims > 128, factor 1..8)
             val shrunkDxt = maybeShrinkRgba(rgbaBytesFinal, texWidth, texHeight, name)
             val encodeW = shrunkDxt?.second ?: texWidth
             val encodeH = shrunkDxt?.third ?: texHeight
             val encodeRgba = shrunkDxt?.first ?: rgbaBytesFinal
 
+            // The unified PC pipeline: DXT/BC sources always become ETC2
+            // (resourcecompiler64's re-decision logic), the ETC2 encoder is
+            // the PC's own etcpack, and the output header/LZ4/flag rules all
+            // live in PcTexTranscoder (single mip, padded dims for ETC2,
+            // LZ4 only >16383 B and under 0.95 ratio, bit 30 stripped,
+            // 0x08 for raw bodies).
             val etc2EncodeStartMs = System.currentTimeMillis()
-            val etc2Bytes = try {
-                Etc2Encoder.encodeRgba8888(encodeRgba, encodeW, encodeH, isOpaque)
-            } catch (e: Exception) {
-                WepWawetLogger.proxyError("MpkgPacker.convertTexDxtToEtc2: ETC2 encoding failed",
-                    "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
+            val built = PcTexTranscoder.transcodeRgbaBody(
+                texiFormat, forceEtc2Compression,
+                origFlags, origUnkInt0, encodeW, encodeH, encodeRgba,
+            ) { r, ww, hh ->
+                try {
+                    if (EtcpackEncoder.isAvailable()) {
+                        EtcpackEncoder.encodeRgba8888(r, ww, hh)
+                    } else {
+                        // etcpack unavailable (should not happen — it ships in
+                        // the same .so as the DXT decoder that just ran).
+                        // Fall back to the legacy etc2comp encoder so the
+                        // wallpaper still ships as VALID ETC2 (block bytes
+                        // may differ from the PC's, everything else exact).
+                        if (Etc2Encoder.isAvailable()) {
+                            Etc2Encoder.encodeRgba8888(r, ww, hh, detectOpaque(r))
+                        } else null
+                    }
+                } catch (e: Exception) {
+                    WepWawetLogger.proxyError("MpkgPacker.convertTexDxtToEtc2: ETC2 encoding failed",
+                        "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
+                    null
+                }
+            } ?: run {
+                WepWawetLogger.proxyWarn("MpkgPacker.convertTexDxtToEtc2: transcode produced no output",
+                    "name" to name, "encode_dims" to "$encodeW x $encodeH")
                 return null
             }
             val etc2ElapsedMs = System.currentTimeMillis() - etc2EncodeStartMs
             logEtc2Timing(name, encodeW, encodeH, etc2ElapsedMs)
-            val blocksX = (encodeW + 3) / 4
-            val blocksY = (encodeH + 3) / 4
-            val expectedEtc2Size = blocksX * blocksY * 16
-            WepWawetLogger.proxy("MpkgPacker.convertTexDxtToEtc2: ETC2 encoded",
-                "name" to name,
-                "etc2_size" to etc2Bytes.size,
-                "expected" to expectedEtc2Size,
-                "compression_ratio" to "%.2f%%".format(etc2Bytes.size * 100.0 / rgbaBytes.size))
 
-            // ---- Step 6: LZ4-compress the ETC2 bytes ----
-            val lz4Factory = net.jpountz.lz4.LZ4Factory.safeInstance()
-            val compressor = lz4Factory.fastCompressor()
-            val lz4Compressed = compressor.compress(etc2Bytes)
-            WepWawetLogger.proxy("MpkgPacker.convertTexDxtToEtc2: LZ4 compressed",
-                "name" to name,
-                "etc2_size" to etc2Bytes.size,
-                "lz4_size" to lz4Compressed.size,
-                "lz4_ratio" to "%.2f%%".format(lz4Compressed.size * 100.0 / etc2Bytes.size))
+            // ---- Step 6: preserve the TEXS0003 section (the PC writer does) ----
+            val result = appendTexsSection(built, texData)
 
-            // ---- Step 7: Build new .tex with format=5, is_lz4=1, ETC2+LZ4 body ----
-            val out = java.io.ByteArrayOutputStream()
-            // 7a: Magic1 + Magic2 (18 bytes, preserved from original)
-            out.write(texData, 0, 18)
-            // 7b: TEXI Header (28 bytes = 7 × int32 LE)
-            writeLeIntToStream(out, 5)              // format = 5 (ETC2 RGBA8)
-            writeLeIntToStream(out, origFlags)      // flags (preserved)
-            writeLeIntToStream(out, encodeW)        // texture_width (v0.7.4 G5: post-shrink)
-            writeLeIntToStream(out, encodeH)        // texture_height
-            writeLeIntToStream(out, encodeW)        // image_width (same as tex_w)
-            writeLeIntToStream(out, encodeH)        // image_height
-            writeLeIntToStream(out, origUnkInt0)    // color (preserved)
-            // 7c: TEXB Container header (9 bytes)
-            out.write(byteArrayOf(
-                0x54, 0x45, 0x58, 0x42,  // "TEXB"
-                0x30, 0x30, 0x30, 0x34,  // "0004"
-                0x00                     // null terminator
-            ))
-            // 7d: TEXB fields (12 bytes: imageCount, format, isVideoMp4)
-            writeLeIntToStream(out, 1)              // image_count = 1
-            writeLeIntToStream(out, -1)             // format = -1 (FIF_UNKNOWN)
-            writeLeIntToStream(out, 0)             // is_video_mp4 = 0
-            // 7e: Mipmap count (4 bytes)
-            writeLeIntToStream(out, 1)              // mipmap_count = 1
-            // 7f: Mipmap 0 with ETC2 RGBA8 + LZ4 compression (16 bytes + data)
-            writeLeIntToStream(out, encodeW)        // width (v0.7.4 G5: post-shrink)
-            writeLeIntToStream(out, encodeH)        // height
-            writeLeIntToStream(out, 1)              // compression = 1 (LZ4)
-            writeLeIntToStream(out, etc2Bytes.size) // uncompressed_size
-            writeLeIntToStream(out, lz4Compressed.size) // compressed_size
-            out.write(lz4Compressed)                // LZ4-compressed ETC2 RGBA8 data
-
-            // ---- Step 7g: Preserve TEXS0003 section (animated texture sequences) ----
-            //
-            // Per the Ghidra decompilation of FUN_1400de870 (the .tex parser at
-            // line 152127), the parser checks for TEXI0001, TEXB0003/0004, and
-            // TEXS0003 sections in a loop. The TEXS section contains per-frame
-            // UV coordinates for animated texture atlases (handled by FUN_1400de440).
-            //
-            // If the original .tex has a TEXS section after the TEXB body, we must
-            // preserve it in the output .tex — the Android app's libscenejni.so
-            // reads it to know which UV region of the texture atlas to display
-            // at each animation frame.
-            //
-            // v0.6.0 (parity §6 6-5): CRITICAL FIX — Walk all mipmaps to find the actual
-            // end of the TEXB body, then look for TEXS. The previous code used
-            // `91 + byteCount` which is only mipmap 0's data — for multi-mipmap .tex
-            // files, mipmaps 1, 2, 3, ... are at offsets 91+mipmap0_size onwards,
-            // and the bytes there look like binary DXT/ETC2 block data (not "TEXS").
-            // The sectionMagic == "TEXS" check would silently fail, dropping the
-            // animated texture sequences.
-            //
-            // The .tex mipmap layout per the spec is:
-            //   [TEXV0005\0][TEXI0001\0][28-byte TEXI header]
-            //   [TEXB0004\0]
-            //   [4-byte imageCount][4-byte format][4-byte isVideoMp4]
-            //   For each image (typically just 1):
-            //     [4-byte mipmap_count]
-            //     For each mipmap:
-            //       [4-byte width][4-byte height][4-byte compression]
-            //       [4-byte uncompressed_size][4-byte byteCount]
-            //       [byteCount bytes of data]
-            //   [TEXS0003\0 ... animation frames] (optional)
-            val texsMipmapCount = readU32Le(texData, 67).toInt().coerceAtLeast(1)
-            // Walk all mipmaps to find the actual end of the TEXB body.
-            // Mipmap layout (after the 4-byte mipmap_count at offset 67):
-            //   offset 71: mipmap 0 header (20 bytes: width+height+compression+uncompressed_size+byteCount)
-            //   offset 91: mipmap 0 body (byteCount bytes)
-            //   then mipmap 1 header (20 bytes) + body (byteCount bytes), etc.
-            var mipPos = 71  // start of mipmap 0's header
-            for (m in 0 until texsMipmapCount) {
-                // Mipmap header: width(4) + height(4) + compression(4) + uncompressed_size(4) + byteCount(4) = 20 bytes
-                // Then byteCount bytes of data
-                if (mipPos + 20 > texData.size) break
-                val mByteCount = readU32Le(texData, mipPos + 16).toInt()
-                mipPos += 20 + mByteCount
-            }
-            WepWawetLogger.proxy("MpkgPacker.convertTexDxtToEtc2: walked mipmaps for TEXS",
-                "name" to name,
-                "mipmap_count" to texsMipmapCount,
-                "texb_body_end" to mipPos,
-                "tex_size" to texData.size,
-                "trailing_bytes" to (texData.size - mipPos))
-            if (mipPos + 9 <= texData.size) {
-                val sectionMagic = String(texData, mipPos, 4, Charsets.US_ASCII)
-                if (sectionMagic == "TEXS") {
-                    val texsBytes = texData.copyOfRange(mipPos, texData.size)
-                    out.write(texsBytes)
-                    WepWawetLogger.proxy("MpkgPacker.convertTexDxtToEtc2: preserved TEXS section (multi-mipmap-aware)",
-                        "name" to name,
-                        "texs_size" to texsBytes.size,
-                        "texs_magic" to String(texsBytes, 0, minOf(8, texsBytes.size), Charsets.US_ASCII),
-                        "mipmap_count_walked" to texsMipmapCount)
-                } else {
-                    WepWawetLogger.proxyDebug("MpkgPacker.convertTexDxtToEtc2: trailing data after last mipmap is not TEXS",
-                        "name" to name,
-                        "trailing_size" to (texData.size - mipPos),
-                        "trailing_magic" to sectionMagic)
-                }
-            }
-
-            val result = out.toByteArray()
-
-            // ---- Step 8: Verify by reading back the structure ----
-            val vMagic1 = String(result, 0, 8, Charsets.US_ASCII)
-            val vMagic2 = String(result, 9, 8, Charsets.US_ASCII)
-            val vFormat = readLeInt(result, 18)
-            val vTexW = readLeInt(result, 26)
-            val vTexH = readLeInt(result, 30)
-            val vFIF = readLeInt(result, 59)
-            val vMipmapCount = readLeInt(result, 67)
-            val vMipmapW = readLeInt(result, 71)
-            val vMipmapH = readLeInt(result, 75)
-            val vCompression = readLeInt(result, 79)
-            val vUncompSize = readLeInt(result, 83)
-            val vCompSize = readLeInt(result, 87)
+            val vInfo = PcTexTranscoder.parse(result)
             WepWawetLogger.proxy("MpkgPacker.convertTexDxtToEtc2 SUCCESS",
                 "name" to name,
+                "dxt_format" to dxtFormat.displayName,
                 "original_size" to texData.size,
                 "converted_size" to result.size,
-                "dxt_format" to dxtFormat.displayName,
-                "tex_width" to texWidth,
-                "tex_height" to texHeight,
-                "rgba_size" to rgbaBytes.size,
-                "etc2_size" to etc2Bytes.size,
-                "lz4_size" to lz4Compressed.size,
-                "verify_magic1" to vMagic1, "verify_magic2" to vMagic2,
-                "verify_format" to vFormat, "verify_texture_width" to vTexW,
-                "verify_texture_height" to vTexH, "verify_fif" to vFIF,
-                "verify_mipmap_count" to vMipmapCount,
-                "verify_mipmap_width" to vMipmapW, "verify_mipmap_height" to vMipmapH,
-                "verify_compression" to vCompression,
-                "verify_uncompressed_size" to vUncompSize,
-                "verify_compressed_size" to vCompSize,
-                "verify_data_starts_at" to 91,
-                "verify_first_8_bytes_hex" to (if (result.size >= 99) result.copyOfRange(91, 99).joinToString("") { "%02x".format(it) } else "file_too_small"))
+                "encode_dims" to "$encodeW x $encodeH",
+                "out_format" to (vInfo?.texiFormat ?: -1),
+                "out_flags" to "0x%02x".format(vInfo?.flags ?: 0),
+                "out_lz4" to (vInfo?.bodyIsLz4 ?: false),
+                "texs_preserved" to (result.size > built.size),
+                "elapsed_ms" to etc2ElapsedMs)
 
-            // ---- Step 9: Store result in texture conversion cache ----
+            // ---- Step 7: Store result in texture conversion cache ----
             texCacheStore(texData, result, name)
 
             return result
@@ -3047,272 +2501,7 @@ object MpkgPacker {
                 "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
             return null
         }
-    }
-
-    /**
-     * Convert a .tex file with RG88 (2-channel: R, G) pixel data to ETC2_RGBA8 + LZ4.
-     *
-     * v0.6.0 (parity §6 6-2): RG88 (format=8) is used by modern scene wallpapers
-     * for normal/roughness/metalness maps. Without this conversion, the .tex is
-     * passed through unchanged — Android's libscenejni.so may render it with wrong
-     * color channels (typically only R is sampled, losing the G channel).
-     *
-     * Pipeline:
-     *   1. Parse .tex header (same as convertTexDxtToEtc2)
-     *   2. Get body bytes (LZ4-decompressed if needed)
-     *   3. Expand RG88 → RGBA8888 (R=R, G=G, B=0, A=255)
-     *   4. Encode RGBA → ETC2 RGBA8 + LZ4
-     *   5. Build new .tex with format=5 (ETC2 RGBA8), compression=1 (LZ4)
-     *
-     * @param texData The original .tex bytes
-     * @param name For logging
-     * @return New .tex bytes, or null on failure
-     */
-    private fun convertTexRg88ToEtc2(texData: ByteArray, name: String): ByteArray? {
-        try {
-            // ---- Check cache ----
-            texCacheLookup(texData, name)?.let { cached ->
-                WepWawetLogger.proxy("MpkgPacker.convertTexRg88ToEtc2: using cached conversion",
-                    "name" to name, "cached_size" to cached.size)
-                return cached
-            }
-
-            if (!Etc2Encoder.isAvailable()) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexRg88ToEtc2: ETC2 native lib not available",
-                    "name" to name)
-                return null
-            }
-
-            if (texData.size < 91) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexRg88ToEtc2: .tex too small",
-                    "name" to name, "tex_size" to texData.size)
-                return null
-            }
-
-            // v0.7.4: validate the mipmap count BEFORE reading the mipmap-0
-            // header fields (offsets 79-91). With mipmapCount == 0 those bytes
-            // aren't a mipmap header at all — the old code read garbage values
-            // for isLz4/decompressedSize/byteCount and decoded bogus data.
-            // Mirrors the guard convertTexDxtToEtc2 already had.
-            val mipCountCheck = readU32Le(texData, 67).toInt()
-            if (mipCountCheck < 1) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexRg88ToEtc2: no mipmaps (mipmapCount=$mipCountCheck)",
-                    "name" to name)
-                return null
-            }
-
-            val texWidth = readU32Le(texData, 26).toInt()
-            val texHeight = readU32Le(texData, 30).toInt()
-            val origFlags = readLeInt(texData, 22)
-            val origUnkInt0 = readLeInt(texData, 42)
-            val isLz4 = readU32Le(texData, 79).toInt() != 0
-            val decompressedSize = readU32Le(texData, 83).toInt()
-            val byteCount = readU32Le(texData, 87).toInt()
-
-            if (texWidth <= 0 || texHeight <= 0) return null
-            if (91 + byteCount > texData.size) return null
-
-            val bodyBytes = texData.copyOfRange(91, 91 + byteCount)
-            val rg88Bytes = if (isLz4) {
-                if (decompressedSize <= 0) return null
-                try {
-                    val lz4Factory = net.jpountz.lz4.LZ4Factory.safeInstance()
-                    lz4Factory.safeDecompressor().decompress(bodyBytes, decompressedSize)
-                } catch (e: Exception) {
-                    WepWawetLogger.proxyError("MpkgPacker.convertTexRg88ToEtc2: LZ4 decompression failed",
-                        "name" to name, "exception" to e.javaClass.name)
-                    return null
-                }
-            } else bodyBytes
-
-            val pixelCount = texWidth * texHeight
-            if (rg88Bytes.size < pixelCount * 2) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexRg88ToEtc2: RG88 data too small",
-                    "name" to name, "expected" to (pixelCount * 2), "actual" to rg88Bytes.size)
-                return null
-            }
-
-            // Expand RG88 → RGBA8888 (R=R, G=G, B=0, A=255)
-            val rgbaBytes = ByteArray(pixelCount * 4)
-            for (i in 0 until pixelCount) {
-                rgbaBytes[i * 4 + 0] = rg88Bytes[i * 2 + 0]  // R
-                rgbaBytes[i * 4 + 1] = rg88Bytes[i * 2 + 1]  // G
-                rgbaBytes[i * 4 + 2] = 0                       // B (no blue in RG88)
-                rgbaBytes[i * 4 + 3] = 255.toByte()            // A (opaque)
-            }
-
-            // Encode RGBA → ETC2 RGBA8 + LZ4 (same as convertTexDxtToEtc2)
-            // v0.7.4 (parity G5): optional texture shrink before the encode —
-            // the .tex header dims below reflect it.
-            val shrunkRg88 = maybeShrinkRgba(rgbaBytes, texWidth, texHeight, name)
-            val rg88EncodeW = shrunkRg88?.second ?: texWidth
-            val rg88EncodeH = shrunkRg88?.third ?: texHeight
-            val rg88EncodeRgba = shrunkRg88?.first ?: rgbaBytes
-            val isOpaque = true  // We just set A=255 everywhere
-            val etc2Bytes = try {
-                Etc2Encoder.encodeRgba8888(rg88EncodeRgba, rg88EncodeW, rg88EncodeH, isOpaque)
-            } catch (e: Exception) {
-                WepWawetLogger.proxyError("MpkgPacker.convertTexRg88ToEtc2: ETC2 encoding failed",
-                    "name" to name, "exception" to e.javaClass.name)
-                return null
-            }
-            val lz4Compressed = net.jpountz.lz4.LZ4Factory.safeInstance().fastCompressor().compress(etc2Bytes)
-
-            // Build output .tex (format=5 ETC2_RGBA8, compression=1 LZ4)
-            val out = java.io.ByteArrayOutputStream()
-            out.write(texData, 0, 18)
-            writeLeIntToStream(out, 5)
-            writeLeIntToStream(out, origFlags)
-            writeLeIntToStream(out, rg88EncodeW)
-            writeLeIntToStream(out, rg88EncodeH)
-            writeLeIntToStream(out, rg88EncodeW)
-            writeLeIntToStream(out, rg88EncodeH)
-            writeLeIntToStream(out, origUnkInt0)
-            out.write(byteArrayOf(0x54, 0x45, 0x58, 0x42, 0x30, 0x30, 0x30, 0x34, 0x00))
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, -1)
-            writeLeIntToStream(out, 0)
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, rg88EncodeW)
-            writeLeIntToStream(out, rg88EncodeH)
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, etc2Bytes.size)
-            writeLeIntToStream(out, lz4Compressed.size)
-            out.write(lz4Compressed)
-
-            val result = out.toByteArray()
-            texCacheStore(texData, result, name)
-            WepWawetLogger.proxy("MpkgPacker.convertTexRg88ToEtc2 SUCCESS",
-                "name" to name, "original_size" to texData.size, "converted_size" to result.size)
-            return result
-        } catch (e: Exception) {
-            WepWawetLogger.proxyError("MpkgPacker.convertTexRg88ToEtc2 FAILED",
-                "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-            return null
-        }
-    }
-
-    /**
-     * Convert a .tex file with R8 (1-channel: R) pixel data to ETC2_RGBA8 + LZ4.
-     *
-     * v0.6.0 (parity §6 6-2): R8 (format=9) is used by scene wallpapers for
-     * grayscale / single-channel masks. Without this conversion, the .tex is
-     * passed through unchanged — Android may sample only the red channel and
-     * miss the grayscale information.
-     *
-     * Pipeline:
-     *   1. Parse .tex header
-     *   2. Get body bytes (LZ4-decompressed if needed)
-     *   3. Expand R8 → RGBA8888 (R=R, G=R, B=R, A=255) — grayscale
-     *   4. Encode RGBA → ETC2 RGBA8 + LZ4
-     *   5. Build new .tex with format=5 (ETC2 RGBA8), compression=1 (LZ4)
-     *
-     * @param texData The original .tex bytes
-     * @param name For logging
-     * @return New .tex bytes, or null on failure
-     */
-    private fun convertTexR8ToEtc2(texData: ByteArray, name: String): ByteArray? {
-        try {
-            texCacheLookup(texData, name)?.let { cached ->
-                WepWawetLogger.proxy("MpkgPacker.convertTexR8ToEtc2: using cached conversion",
-                    "name" to name, "cached_size" to cached.size)
-                return cached
-            }
-
-            if (!Etc2Encoder.isAvailable()) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexR8ToEtc2: ETC2 native lib not available",
-                    "name" to name)
-                return null
-            }
-
-            if (texData.size < 91) return null
-            // v0.7.4: validate the mipmap count before reading the mipmap-0 header
-            // fields (see convertTexRg88ToEtc2 for the rationale).
-            if (readU32Le(texData, 67).toInt() < 1) return null
-
-            val texWidth = readU32Le(texData, 26).toInt()
-            val texHeight = readU32Le(texData, 30).toInt()
-            val origFlags = readLeInt(texData, 22)
-            val origUnkInt0 = readLeInt(texData, 42)
-            val isLz4 = readU32Le(texData, 79).toInt() != 0
-            val decompressedSize = readU32Le(texData, 83).toInt()
-            val byteCount = readU32Le(texData, 87).toInt()
-
-            if (texWidth <= 0 || texHeight <= 0) return null
-            if (91 + byteCount > texData.size) return null
-
-            val bodyBytes = texData.copyOfRange(91, 91 + byteCount)
-            val r8Bytes = if (isLz4) {
-                if (decompressedSize <= 0) return null
-                try {
-                    val lz4Factory = net.jpountz.lz4.LZ4Factory.safeInstance()
-                    lz4Factory.safeDecompressor().decompress(bodyBytes, decompressedSize)
-                } catch (e: Exception) { return null }
-            } else bodyBytes
-
-            val pixelCount = texWidth * texHeight
-            if (r8Bytes.size < pixelCount) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexR8ToEtc2: R8 data too small",
-                    "name" to name, "expected" to pixelCount, "actual" to r8Bytes.size)
-                return null
-            }
-
-            // Expand R8 → RGBA8888 (R=R, G=R, B=R, A=255) — grayscale
-            val rgbaBytes = ByteArray(pixelCount * 4)
-            for (i in 0 until pixelCount) {
-                val v = r8Bytes[i]
-                rgbaBytes[i * 4 + 0] = v  // R
-                rgbaBytes[i * 4 + 1] = v  // G (grayscale)
-                rgbaBytes[i * 4 + 2] = v  // B (grayscale)
-                rgbaBytes[i * 4 + 3] = 255.toByte()  // A
-            }
-
-            // v0.7.4 (parity G5): optional texture shrink before the encode —
-            // the .tex header dims below reflect it.
-            val shrunkR8 = maybeShrinkRgba(rgbaBytes, texWidth, texHeight, name)
-            val r8EncodeW = shrunkR8?.second ?: texWidth
-            val r8EncodeH = shrunkR8?.third ?: texHeight
-            val r8EncodeRgba = shrunkR8?.first ?: rgbaBytes
-            val isOpaque = true
-            val etc2Bytes = try {
-                Etc2Encoder.encodeRgba8888(r8EncodeRgba, r8EncodeW, r8EncodeH, isOpaque)
-            } catch (e: Exception) { return null }
-            val lz4Compressed = net.jpountz.lz4.LZ4Factory.safeInstance().fastCompressor().compress(etc2Bytes)
-
-            val out = java.io.ByteArrayOutputStream()
-            out.write(texData, 0, 18)
-            writeLeIntToStream(out, 5)
-            writeLeIntToStream(out, origFlags)
-            writeLeIntToStream(out, r8EncodeW)
-            writeLeIntToStream(out, r8EncodeH)
-            writeLeIntToStream(out, r8EncodeW)
-            writeLeIntToStream(out, r8EncodeH)
-            writeLeIntToStream(out, origUnkInt0)
-            out.write(byteArrayOf(0x54, 0x45, 0x58, 0x42, 0x30, 0x30, 0x30, 0x34, 0x00))
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, -1)
-            writeLeIntToStream(out, 0)
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, r8EncodeW)
-            writeLeIntToStream(out, r8EncodeH)
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, etc2Bytes.size)
-            writeLeIntToStream(out, lz4Compressed.size)
-            out.write(lz4Compressed)
-
-            val result = out.toByteArray()
-            texCacheStore(texData, result, name)
-            WepWawetLogger.proxy("MpkgPacker.convertTexR8ToEtc2 SUCCESS",
-                "name" to name, "original_size" to texData.size, "converted_size" to result.size)
-            return result
-        } catch (e: Exception) {
-            WepWawetLogger.proxyError("MpkgPacker.convertTexR8ToEtc2 FAILED",
-                "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-            return null
-        }
-    }
-
-    /**
+    }    /**
      * v0.7.16 (PC-exact): the format=0 / format=20 .tex pipeline — what the
      * PC's `resourcecompiler64.exe -transcode -f ETC2 -maxmipmaps 1` does to
      * a texture, reconstructed from a real PC-produced .mpkg (ground truth)
@@ -3372,12 +2561,17 @@ object MpkgPacker {
             if (pngStart >= 0 || jpgStart >= 0) {
                 val decoded = decodeLargestImageToRgba(effectiveTex, name)
                 if (decoded != null) {
-                    val (rgba, w, h) = decoded
+                    val (rgba0, w0, h0) = decoded
+                    val shrunk = maybeShrinkRgba(rgba0, w0, h0, name)
+                    val (rgba, w, h) = shrunk?.let { Triple(it.first, it.second, it.third) } ?: Triple(rgba0, w0, h0)
                     val result = PcTexTranscoder.transcodeRgbaBody(
+                        effInfo.texiFormat, forceEtc2Compression,
                         effInfo.flags, effInfo.color, w, h, rgba,
                     ) { r, ww, hh ->
                         try {
-                            Etc2Encoder.encodeRgba8888(r, ww, hh, detectOpaque(r))
+                            if (EtcpackEncoder.isAvailable()) {
+                                EtcpackEncoder.encodeRgba8888(r, ww, hh)
+                            } else null
                         } catch (e: Exception) {
                             WepWawetLogger.proxyError("MpkgPacker.convertFormat0TexPc: ETC2 encode failed",
                                 "name" to name, "exception" to e.javaClass.name)
@@ -3385,15 +2579,18 @@ object MpkgPacker {
                         }
                     }
                     if (result != null) {
-                        texCacheStore(texData, result, name)
+                        val withTexs = appendTexsSection(result, texData)
+                        texCacheStore(texData, withTexs, name)
                         WepWawetLogger.proxy("MpkgPacker.convertFormat0TexPc: image transcoded (PC pipeline)",
                             "name" to name,
                             "source_kind" to "image",
                             "width" to w, "height" to h,
-                            "etc2" to PcTexTranscoder.shouldUseEtc2(w, h),
+                            "shrunk" to (shrunk != null),
+                            "etc2" to PcTexTranscoder.shouldUseEtc2(effInfo.texiFormat, forceEtc2Compression),
+                            "texs_preserved" to (withTexs.size > result.size),
                             "original_size" to texData.size,
-                            "converted_size" to result.size)
-                        return result
+                            "converted_size" to withTexs.size)
+                        return withTexs
                     }
                 } else {
                     WepWawetLogger.proxyWarn("MpkgPacker.convertFormat0TexPc: image decode failed — trying raw-RGBA interpretation",
@@ -3403,23 +2600,29 @@ object MpkgPacker {
 
             // ── raw (or LZ4-decompressed) RGBA body at the mip dims ──
             val result = PcTexTranscoder.transcodeRgbaBody(
+                effInfo.texiFormat, forceEtc2Compression,
                 effInfo.flags, effInfo.color, effInfo.mipW, effInfo.mipH, body,
             ) { r, ww, hh ->
                 try {
-                    Etc2Encoder.encodeRgba8888(r, ww, hh, detectOpaque(r))
+                    if (EtcpackEncoder.isAvailable()) {
+                        EtcpackEncoder.encodeRgba8888(r, ww, hh)
+                    } else null
                 } catch (e: Exception) {
                     null
                 }
             }
             if (result != null) {
-                texCacheStore(texData, result, name)
+                val withTexs = appendTexsSection(result, texData)
+                texCacheStore(texData, withTexs, name)
                 WepWawetLogger.proxy("MpkgPacker.convertFormat0TexPc: RGBA body transcoded (PC pipeline)",
                     "name" to name,
                     "source_kind" to if (info.bodyIsLz4) "lz4-rgba" else "raw-rgba",
                     "width" to effInfo.mipW, "height" to effInfo.mipH,
-                    "etc2" to PcTexTranscoder.shouldUseEtc2(effInfo.mipW, effInfo.mipH),
+                    "etc2" to PcTexTranscoder.shouldUseEtc2(effInfo.texiFormat, forceEtc2Compression),
+                    "texs_preserved" to (withTexs.size > result.size),
                     "original_size" to texData.size,
-                    "converted_size" to result.size)
+                    "converted_size" to withTexs.size)
+                return withTexs
             } else {
                 WepWawetLogger.proxyWarn("MpkgPacker.convertFormat0TexPc: RGBA body rejected",
                     "name" to name,
@@ -3575,120 +2778,6 @@ object MpkgPacker {
             null
         }
     }
-
-    private fun convertTexRgba8888ToEtc2(texData: ByteArray, name: String): ByteArray? {
-        try {
-            texCacheLookup(texData, name)?.let { cached ->
-                WepWawetLogger.proxy("MpkgPacker.convertTexRgba8888ToEtc2: using cached conversion",
-                    "name" to name, "cached_size" to cached.size)
-                return cached
-            }
-
-            if (!Etc2Encoder.isAvailable()) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexRgba8888ToEtc2: ETC2 native lib not available — passing through unchanged",
-                    "name" to name)
-                return null
-            }
-
-            if (texData.size < 91) return null
-            // v0.7.4: validate the mipmap count before reading the mipmap-0 header
-            // fields (see convertTexRg88ToEtc2 for the rationale).
-            if (readU32Le(texData, 67).toInt() < 1) return null
-
-            val texWidth = readU32Le(texData, 26).toInt()
-            val texHeight = readU32Le(texData, 30).toInt()
-            val origFlags = readLeInt(texData, 22)
-            val origUnkInt0 = readLeInt(texData, 42)
-            val isLz4 = readU32Le(texData, 79).toInt() != 0
-            val decompressedSize = readU32Le(texData, 83).toInt()
-            val byteCount = readU32Le(texData, 87).toInt()
-
-            if (texWidth <= 0 || texHeight <= 0) return null
-            if (91 + byteCount > texData.size) return null
-
-            val bodyBytes = texData.copyOfRange(91, 91 + byteCount)
-            val rgbaBytes = if (isLz4) {
-                if (decompressedSize <= 0) return null
-                try {
-                    val lz4Factory = net.jpountz.lz4.LZ4Factory.safeInstance()
-                    lz4Factory.safeDecompressor().decompress(bodyBytes, decompressedSize)
-                } catch (e: Exception) { return null }
-            } else bodyBytes
-
-            val expectedSize = texWidth * texHeight * 4
-            if (rgbaBytes.size < expectedSize) {
-                WepWawetLogger.proxyWarn("MpkgPacker.convertTexRgba8888ToEtc2: RGBA data too small",
-                    "name" to name, "expected" to expectedSize, "actual" to rgbaBytes.size)
-                return null
-            }
-
-            // v0.6.0 (parity §6 6-7): Detect opaque vs alpha-textured.
-            // For opaque textures, use RGBX error metric (treats alpha as don't-care,
-            // gaining ~0.5 dB PSNR on RGB channels).
-            // Sample every 1024th pixel's alpha to avoid full scan.
-            var isOpaque = true
-            val sampleStep = 4 * 1024
-            var i = 3  // alpha byte of first pixel
-            while (i < rgbaBytes.size) {
-                if ((rgbaBytes[i].toInt() and 0xFF) != 255) {
-                    isOpaque = false
-                    break
-                }
-                i += sampleStep
-            }
-
-            // v0.7.4 (parity G5): optional texture shrink before the encode —
-            // the .tex header dims below reflect it.
-            val shrunkRgba8888 = maybeShrinkRgba(rgbaBytes, texWidth, texHeight, name)
-            val rgba8888EncodeW = shrunkRgba8888?.second ?: texWidth
-            val rgba8888EncodeH = shrunkRgba8888?.third ?: texHeight
-            val rgba8888EncodeRgba = shrunkRgba8888?.first ?: rgbaBytes
-            val etc2Bytes = try {
-                Etc2Encoder.encodeRgba8888(rgba8888EncodeRgba, rgba8888EncodeW, rgba8888EncodeH, isOpaque)
-            } catch (e: Exception) {
-                WepWawetLogger.proxyError("MpkgPacker.convertTexRgba8888ToEtc2: ETC2 encoding failed",
-                    "name" to name, "exception" to e.javaClass.name)
-                return null
-            }
-            val lz4Compressed = net.jpountz.lz4.LZ4Factory.safeInstance().fastCompressor().compress(etc2Bytes)
-
-            val out = java.io.ByteArrayOutputStream()
-            out.write(texData, 0, 18)
-            writeLeIntToStream(out, 5)
-            writeLeIntToStream(out, origFlags)
-            writeLeIntToStream(out, rgba8888EncodeW)
-            writeLeIntToStream(out, rgba8888EncodeH)
-            writeLeIntToStream(out, rgba8888EncodeW)
-            writeLeIntToStream(out, rgba8888EncodeH)
-            writeLeIntToStream(out, origUnkInt0)
-            out.write(byteArrayOf(0x54, 0x45, 0x58, 0x42, 0x30, 0x30, 0x30, 0x34, 0x00))
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, -1)
-            writeLeIntToStream(out, 0)
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, rgba8888EncodeW)
-            writeLeIntToStream(out, rgba8888EncodeH)
-            writeLeIntToStream(out, 1)
-            writeLeIntToStream(out, etc2Bytes.size)
-            writeLeIntToStream(out, lz4Compressed.size)
-            out.write(lz4Compressed)
-
-            val result = out.toByteArray()
-            texCacheStore(texData, result, name)
-            WepWawetLogger.proxy("MpkgPacker.convertTexRgba8888ToEtc2 SUCCESS",
-                "name" to name,
-                "original_size" to texData.size,
-                "converted_size" to result.size,
-                "is_opaque" to isOpaque,
-                "size_ratio" to "%.2fx".format(result.size.toDouble() / texData.size.toDouble()))
-            return result
-        } catch (e: Exception) {
-            WepWawetLogger.proxyError("MpkgPacker.convertTexRgba8888ToEtc2 FAILED",
-                "name" to name, "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-            return null
-        }
-    }
-
     /**
      * Rewrite project.json for the WE Android .mpkg format.
      *
@@ -4572,10 +3661,12 @@ object MpkgPacker {
     }
 
     /**
-     * v0.7.4 (parity G5): optional texture shrink — the PC's
-     * "texturereduction" / -shrink lever. Box-filters an RGBA buffer down
-     * by [textureShrinkFactor] (2 = half, 4 = quarter), snapping the output
-     * to 4-px multiples so ETC2 4×4 blocks stay aligned.
+     * v0.7.18 (PC-exact): the `-shrink <n>` lever — resourcecompiler64
+     * FUN_140063c70 @1400645e1 applies the reduction ONLY when BOTH source
+     * dims exceed 128 px, with the factor clamped to 1..8 and the new dims
+     * taken by integer division (no 4-px snapping — the ETC2 path pads
+     * afterwards). The resample is a bilinear filter with pixel-center
+     * alignment (OpenCV INTER_LINEAR, the PC's cv::resize default).
      *
      * @return null when shrinking is disabled or the texture is too small;
      *         otherwise the shrunken (bytes, width, height).
@@ -4583,47 +3674,83 @@ object MpkgPacker {
     private fun maybeShrinkRgba(
         rgba: ByteArray, width: Int, height: Int, name: String,
     ): Triple<ByteArray, Int, Int>? {
-        val factor = textureShrinkFactor
-        if (factor <= 1) return null
-        if (width < factor * 4 || height < factor * 4) return null
-
-        val newW = (width / factor / 4) * 4
-        val newH = (height / factor / 4) * 4
-        if (newW < 4 || newH < 4) return null
+        val (newW, newH) = PcTexTranscoder.shrinkDims(width, height, textureShrinkFactor)
+        if (newW == width && newH == height) return null
 
         val out = ByteArray(newW * newH * 4)
-        val xRatio = width.toDouble() / newW
-        val yRatio = height.toDouble() / newH
+        val xScale = width.toDouble() / newW
+        val yScale = height.toDouble() / newH
         for (y in 0 until newH) {
-            val sy0 = (y * yRatio).toInt()
-            val sy1 = (((y + 1) * yRatio).toInt() + 1).coerceAtMost(height)
+            // pixel-center aligned source coordinate (INTER_LINEAR)
+            val fy = (y + 0.5) * yScale - 0.5
+            val sy0 = fy.toInt().coerceIn(0, height - 1)
+            val sy1 = (sy0 + 1).coerceAtMost(height - 1)
+            val wy = (fy - sy0).coerceIn(0.0, 1.0)
             for (x in 0 until newW) {
-                val sx0 = (x * xRatio).toInt()
-                val sx1 = (((x + 1) * xRatio).toInt() + 1).coerceAtMost(width)
-                var r = 0L; var g = 0L; var b = 0L; var a = 0L; var n = 0L
-                for (sy in sy0 until sy1) {
-                    var idx = (sy * width + sx0) * 4
-                    for (sx in sx0 until sx1) {
-                        r += rgba[idx]; g += rgba[idx + 1]
-                        b += rgba[idx + 2]; a += rgba[idx + 3]
-                        n++; idx += 4
-                    }
-                }
+                val fx = (x + 0.5) * xScale - 0.5
+                val sx0 = fx.toInt().coerceIn(0, width - 1)
+                val sx1 = (sx0 + 1).coerceAtMost(width - 1)
+                val wx = (fx - sx0).coerceIn(0.0, 1.0)
                 val o = (y * newW + x) * 4
-                out[o] = (r / n).toByte()
-                out[o + 1] = (g / n).toByte()
-                out[o + 2] = (b / n).toByte()
-                out[o + 3] = (a / n).toByte()
+                for (c in 0 until 4) {
+                    val i00 = ((sy0 * width + sx0) * 4 + c).toByte().toInt() and 0xFF
+                    val i01 = ((sy0 * width + sx1) * 4 + c).toByte().toInt() and 0xFF
+                    val i10 = ((sy1 * width + sx0) * 4 + c).toByte().toInt() and 0xFF
+                    val i11 = ((sy1 * width + sx1) * 4 + c).toByte().toInt() and 0xFF
+                    val top = i00 + ((i01 - i00) * wx)
+                    val bottom = i10 + ((i11 - i10) * wx)
+                    out[o + c] = (top + (bottom - top) * wy).toInt().coerceIn(0, 255).toByte()
+                }
             }
         }
-        WepWawetLogger.proxy("MpkgPacker: texture shrink applied (G5 texturereduction)",
+        WepWawetLogger.proxy("MpkgPacker: texture shrink applied (PC -shrink rule)",
             "name" to name,
-            "factor" to factor,
+            "factor" to textureShrinkFactor,
             "from" to "${width}x${height}",
             "to" to "${newW}x$newH",
             "bytes_before" to rgba.size,
             "bytes_after" to out.size)
         return Triple(out, newW, newH)
+    }
+
+    /**
+     * Append the source .tex's TEXS0003 section (animated-texture frame
+     * sequences) to a freshly built single-mip output — the PC's .tex writer
+     * preserves it (FUN_14005c930 references "TEXS0003", as does the loader
+     * FUN_140007040), so a transcoded texture that carries sprite-sequence
+     * data keeps it byte-for-byte after the new body.
+     *
+     * The section is found by walking the SOURCE mip chain structurally
+     * (header-by-header, honoring each mip's byteCount) and checking the
+     * magic at the chain's end — never by a raw byte scan, which false-
+     * positives on compressed block data.
+     */
+    private fun appendTexsSection(built: ByteArray, sourceTex: ByteArray): ByteArray {
+        try {
+            val info = PcTexTranscoder.parse(sourceTex) ?: return built
+            val mipCount = info.mipCount.coerceAtLeast(1)
+            var mipPos = if (info.texbVersion == 3) 67 else 71
+            for (m in 0 until mipCount) {
+                if (mipPos + 20 > sourceTex.size) return built
+                val mByteCount = readU32Le(sourceTex, mipPos + 16).toInt()
+                if (mByteCount < 0) return built
+                mipPos += 20 + mByteCount
+            }
+            if (mipPos + 9 <= sourceTex.size) {
+                val sectionMagic = String(sourceTex, mipPos, 4, Charsets.US_ASCII)
+                if (sectionMagic == "TEXS") {
+                    val texsBytes = sourceTex.copyOfRange(mipPos, sourceTex.size)
+                    WepWawetLogger.proxy("MpkgPacker.appendTexsSection: preserved TEXS section",
+                        "texs_size" to texsBytes.size,
+                        "mipmaps_walked" to mipCount)
+                    return built + texsBytes
+                }
+            }
+        } catch (e: Exception) {
+            WepWawetLogger.proxyWarn("MpkgPacker.appendTexsSection: failed — shipping without TEXS",
+                "exception" to e.javaClass.name)
+        }
+        return built
     }
 
     private fun fixSceneJsonTextureBindings(entries: MutableList<Pair<String, ByteArray>>) {

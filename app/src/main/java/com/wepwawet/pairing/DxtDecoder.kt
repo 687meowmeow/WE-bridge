@@ -51,25 +51,19 @@ object DxtDecoder {
     /**
      * Reverse map of .tex TexI format field → DxtFormat.
      *
-     * v0.6.0 (parity §6 6-1): CRITICAL FIX — format codes 13 and 14 are BC6H and BC7
-     * respectively (NOT FIF_PNG/FIF_JPEG as previously documented). The previous
-     * comment was wrong, derived from a misinterpretation of the repkg source.
-     * The actual PNG/JPEG-encoded .tex files have TexI format=0 (FIF_UNKNOWN)
-     * with TexB format=13 (FIF_PNG) or 2 (FIF_JPEG) — they're handled by
-     * convertTexPngToEtc2 via magic-byte detection.
-     *
-     * Per the repkg TexFormat enum (https://github.com/notscuffed/repkg):
-     *   0=RGBA8888, 4=DXT5, 6=DXT3, 7=DXT1, 8=RG88, 9=R8, 11=BC4, 12=BC5,
-     *   13=BC6H (HDR), 14=BC7 (high-quality), 20=ETC2_RGBA8
+     * v0.7.18 (PC-exact, from resourcecompiler64.exe FUN_140063c70's switch):
+     * the PC's transcoder handles ONLY formats 4 (DXT5), 6 (DXT3), 7 (DXT1)
+     * and 12 (BC7 — internal codec code 0x35, the "Compressing as BC7" path;
+     * the old repkg-derived "12 = BC5" mapping was wrong). Every other
+     * block-compressed format (11 = BC4, 13 = BC6H, 14 = BC7-per-repkg — the
+     * PC tool ERRORS on them and the original bytes ship unchanged) returns
+     * null here so [MpkgPacker] passes the file through verbatim.
      */
     private val TEX_FORMAT_TO_DXT = mapOf(
-        4 to Format.DXT5,    // repkg: DXT5
-        6 to Format.DXT3,    // repkg: DXT3
-        7 to Format.DXT1,    // repkg: DXT1
-        11 to Format.BC4,    // BC4 (RGTC1)
-        12 to Format.BC5,    // BC5 (RGTC2)
-        13 to Format.BC6H,   // v0.6.0: BC6H (HDR RGB float) — was incorrectly routed to FIF_PNG
-        14 to Format.BC7,    // v0.6.0: BC7 (high-quality 8-mode) — was incorrectly routed to FIF_JPEG
+        4 to Format.DXT5,    // DXT5
+        6 to Format.DXT3,    // DXT3
+        7 to Format.DXT1,    // DXT1
+        12 to Format.BC7,    // v0.7.18: BC7 (NOT BC5) — the PC's code 0x35
     )
 
     /**

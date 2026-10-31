@@ -2209,3 +2209,102 @@ Follow-up notes for future agents:
   * The engine silently DROPS effects that fail to compile — "no visible
     error" on the real app does NOT mean the effect rendered. Our backend
     now makes them compile instead.
+
+## v0.7.18-alpha — the etcpack release: byte-exact ETC2 + the true transcoder rules
+
+Both binaries the user supplied (wallpaperui.exe + resourcecompiler64.exe) were
+decompiled with Ghidra 12.2 headless this session (fresh project; the cached
+work/ tree from the earlier passes was gone with the sandbox). Every rule below
+was re-derived from the disassembly AND cross-checked against the ground-truth
+fixtures — plus the parity report the previous session left in
+/home/z/my-project/download/WE_packing_parity_report_v0.7.18.md (its code was
+lost when that sandbox was recycled before the commit; this release is the
+re-implementation, independently re-verified).
+
+THE ETC2 ENCODER — IDENTIFIED AND VENDORED
+  RTTI (.?AVCCodec_ETC2_RGBA@@ + CCodec@AMD_Compress) and the vtable walk prove
+  the PC's encoder is Ericsson's etcpack (via AMD Compressonator v3.x, m_fast
+  = true): compressBlockAlphaFast + compressBlockETC2FastPerceptual. The exact
+  block pipeline (decoded from FUN_1400598c0/140059720/140115ce0/1400da510):
+    1. pad-to-4 (column pads repeat the row's last pixel with alpha zeroed;
+       pad rows duplicate the last row; align 4 for single-mip)
+    2. an in-place R<->B byte swap that CANCELS against the [byte2,byte1,byte0]
+       staging — vanilla etcpack is fed plain [R,G,B] row-major
+    3. per block: 16 alphas (row-major) + 4x4x3 RGB, output
+       [8 alpha bytes][bswap(word1)][bswap(word2)]
+  etcpack (Ericsson SLA: binary use for OpenGL ES compression is licensed) is
+  now vendored at app/src/main/cpp/etcpack/ + etcpack_jni.cpp + EtcpackEncoder.kt
+  — the same .so as the DXT decoder. THIS is why every etc2comp attempt
+  produced different bytes: the PC never used etc2comp.
+  Verified on the host: roundtrip_test.cpp encodes known blocks and decodes
+  them with etcpack's own decoder — orientation, channels, alpha and the
+  pad-4 semantics all verified on asymmetric (6x6) sizes.
+
+THE TRUE TRANSCODER RULES (this is a BEHAVIOR CHANGE from v0.7.16/17)
+  • ETC2-vs-RGBA follows the SOURCE FORMAT, NOT the pixel count — the
+    ">2048 px => ETC2" rule was a coincidence of one ground-truth file.
+    DXT/BC sources (4=DXT5, 6=DXT3, 7=DXT1, 12=BC7 — NOT BC5; internal codec
+    code 0x35 = the "Compressing as BC7" path) always become ETC2; format 0
+    (RGBA8888 incl. PNG/JPEG bodies) and 1 (RGB888) stay RGBA8888 unless
+    -c force. No size threshold exists.
+  • -c force is appended only when the .tex's parent path is materials or
+    materials\masks AND the paired device's "compression" setting !=
+    "high_quality" (FUN_140019b80). WepWawet defaults to high_quality (false)
+    — the setting that produced the byte-verified reference .mpkg — and
+    exposes MpkgPacker.forceEtc2Compression to mirror the PC's "compressed"
+    device option.
+  • LZ4 storage (FUN_14005ab90): attempted ONLY when the body is > 16383
+    bytes; kept ONLY when (float)compressed/(float)raw < 0.95. This makes
+    waterflowphase BYTE-EXACT (4096 B body -> never compressed -> flags
+    0x00 -> 0x08): all three ground-truth textures now reproduce the PC
+    output byte-for-byte on the JVM.
+  • Output TEXI flags: (sourceFlags AND NOT 0x40000000) OR 0x08-when-raw.
+    (Ground truth: waterflowphase 0x00->0x08 raw; output-onlinepngtools
+    0x02->0x02 LZ4 — the 0x08 bit tracks RAW storage.)
+  • Copy-through verbatim: formats 8 (RG88), 9 (R8), imageCount > 1
+    (animated/spritesheet), TEXI flags & 0x20, format 1 without force.
+  • Formats the tool ERRORS on (5, 11, 13, 14, 20, ...) — wallpaperui IGNORES
+    the exit code, so the original bytes ship. v0.7.16/17 wrongly converted
+    format 20 and DXT-decoded 11/13/14; they now pass through like the PC.
+  • -shrink: applied only when BOTH source dims exceed 128, factor clamped
+    1..8, new dims by integer division, bilinear resample (OpenCV
+    INTER_LINEAR semantics with pixel-center alignment).
+  • The TEXS0003 section is preserved after the built body for BOTH the DXT
+    and format-0 paths (the PC's writer references TEXS0003; the old code
+    only preserved it on the DXT path).
+  • ETC2 outputs carry the 4-padded dims in texW/texH and the mip entry.
+
+zcompat: the shipped database is COMPLETE — the user's assets.zip confirms
+  the PC's assets/zcompat contains exactly the 2 scene/shaders entries we
+  already ship (byte-identical) plus 5 web entries (JS patches for specific
+  workshop web wallpapers). The web JSONs are now shipped under
+  app/assets/zcompat/web/ for completeness (wallpaperui does NOT read them
+  during transfers — they belong to the shared-assets pipeline).
+
+VERIFICATION (all automated, this session)
+  • 50/50 JVM unit tests pass (32 PcPipelineTest — all three ground-truth
+    .tex now byte-exact — + 18 ShaderEsslSafetyTest).
+  • Full compile of MpkgPacker.kt + the whole pairing set against Android
+    API stubs: ZERO errors (an earlier draft had a nested-Pair bug the
+    type-check caught — fixed).
+  • Shader sweep: all 488 shaders of the user's assets/ processed through
+    deprModFix -> fixShader -> ESSL safety: no exceptions, deterministic,
+    170 edited.
+  • ESSL 3.00 validation (glslang 16.6, engine header/combos/includes
+    reconstructed): 433/484 pass; all 51 failures are harness artifacts
+    (45 in the combos=1 stress mode the engine never applies wholesale,
+    5 engine-core shaders needing runtime combo values, 1 zcompat/preview
+    fixture) — same classes of failure the v0.7.17 audit documented.
+  • END-TO-END packing (JVM, stubbed Android): 9 scene demo projects
+    (deep_space … techno) + a web wallpaper (js/ tree included, sounds/
+    dropped) + a video wallpaper (PKGM0014, [project.json, preview.jpg,
+    wallpaper.mp4]) all pack to structurally-valid, correctly-sorted mpkgs
+    with workshopurl; the tex audit confirms fmt5 passthrough and fmt0
+    conversion counts on every demo.
+
+Remaining known limitation: the ETC2 block bytes for DXT/BC sources are now
+produced by the same etcpack build the PC uses, but an end-to-end byte
+comparison against a PC-produced DXT->ETC2 texture still wants the original
+MSK12003_x.tex pair from the reference transfer to be re-shared (the repo's
+test resources only carry its LZ4 body size). Everything else about those
+outputs (header, dims, flags, LZ4, ordering) is byte-verified.
