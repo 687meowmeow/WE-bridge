@@ -1,4 +1,4 @@
-# WepWawet (Wallpaper Engine backend)
+# WepWawet
 
 > Steam Workshop browser & downloader for Android. Browse 3M+ Wallpaper Engine workshop items, log in with your own Steam account, and download wallpaper packs straight to your phone. **No PC required.**
 
