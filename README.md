@@ -1,6 +1,6 @@
-# WepWawet
+# WepWawet (Wallpaper Engine backend)
 
-> Steam Workshop browser & downloader for Android. Browse 3M+ Wallpaper Engine workshop items, log in with your own Steam account (2FA / Steam Guard supported), and download wallpaper packs straight to your phone. **No PC required.**
+> Steam Workshop browser & downloader for Android. Browse 3M+ Wallpaper Engine workshop items, log in with your own Steam account, and download wallpaper packs straight to your phone. **No PC required.**
 
 **Status: v0.7.x-alpha — functional alpha.** Browse → login → download works end-to-end on-device. A pairing proxy is included for the official Wallpaper Engine Android app.
 
@@ -61,10 +61,9 @@ The JavaSteam fork exists because upstream skips some Wallpaper Engine workshop 
 | `app/src/main/java/com/wepwawet/auth/` | Steam login activity |
 | `app/src/main/java/com/wepwawet/log/` | Logger, crash handler, log persistence |
 | `app/src/main/cpp/` | JNI + bundled etc2comp |
-| `app/proguard-rules.pro` | R8 rules (Gson reflection, LZ4 — **don't remove these**, see `worklog.md`) |
+| `app/proguard-rules.pro` | R8 rules |
 | `app/debug.keystore` | Stable debug keystore so all builds share a signing key |
 | `.github/workflows/build.yml` | CI: build the APK and attach it to a release |
-| `worklog.md` | Running audit notes and regression history |
 
 ## Device requirements
 
@@ -87,7 +86,7 @@ Requirements: JDK 17 and the Android SDK with NDK + CMake.
 
 ## Disclaimer
 
-Not affiliated with Valve, Steam, or Wallpaper Engine / Kristjan Skutta. You need your own Steam account, and you should only download content you own or are allowed to use. Respect the workshop creators' terms.
+Not affiliated with Valve, Steam, or Wallpaper Engine / Kristjan Skutta. You need your own Steam account.
 
 ## License
 
