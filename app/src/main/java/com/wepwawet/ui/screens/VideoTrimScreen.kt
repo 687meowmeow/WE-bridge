@@ -4,11 +4,13 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,7 +18,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
@@ -91,9 +97,16 @@ import java.io.File
  * outside the selected range. The RangeSlider sits on top with
  * transparent track colors — only the thumb handles are visible,
  * sitting on top of the strip like every other mobile video trimmer
- * (WhatsApp / iMovie / CapCut / etc.). 16 frame thumbnails evenly
- * spaced across the bar so the user has a clear visual sense of the
- * video's content as they drag.
+ * (WhatsApp / iMovie / CapCut / etc.).
+ *
+ * v0.7.20: The filmstrip is now HORIZONTALLY SCROLLABLE with 40
+ * frames (up from a fixed 16 that were squashed into the screen
+ * width). Each frame is a fixed width derived from the video's
+ * aspect ratio, so the strip is much wider than the screen — the
+ * user scrolls across it like in a real video editor. The whole
+ * screen is also vertically scrollable so that tall (portrait)
+ * videos don't push the trim controls off the bottom of the
+ * screen. The video preview's aspect ratio is preserved exactly.
  *
  * "Trim & Send" trims the video (lossless stream copy via
  * [VideoTrimmer.trim]) and queues it for transfer.
@@ -170,11 +183,15 @@ fun VideoTrimScreen(
                 WepWawetLogger.workshop("VideoTrimScreen: metadata loaded",
                     "duration_ms" to dur, "width" to w, "height" to h)
 
-                // Generate 16 frame thumbnails evenly spaced across the
-                // video duration. Using OPTION_CLOSEST_SYNC (sync frames
-                // only) is fast — each call is ~10-30ms even for big videos,
-                // so 16 calls add up to well under a second.
-                val thumbCount = 16
+                // v0.7.20: Generate 40 frame thumbnails (up from 16) evenly
+                // spaced across the video duration. The filmstrip is now
+                // horizontally scrollable, so the frames are NOT squashed
+                // into the screen width — each is rendered at its natural
+                // aspect-ratio-derived width and the user scrolls across.
+                // Using OPTION_CLOSEST_SYNC (sync frames only) is fast —
+                // each call is ~10-30ms even for big videos, so 40 calls
+                // add up to well under 1.5 seconds.
+                val thumbCount = 40
                 for (i in 0 until thumbCount) {
                     val t = if (thumbCount > 1) dur * i / (thumbCount - 1) else 0
                     val bmp = retriever.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
@@ -218,22 +235,49 @@ fun VideoTrimScreen(
         16f / 9f
     }
 
+    // v0.7.20: Filmstrip dimensions — each frame is a fixed height (72dp)
+    // with width derived from the video's aspect ratio, so frames display
+    // at the correct proportions. The total strip width = frameWidth ×
+    // frameCount, which is much wider than the screen — the user scrolls
+    // horizontally across the strip like in a real video editor.
+    val filmstripHeight = 72.dp
+    val frameWidthDp = filmstripHeight * aspectRatio
+    // thumbCount must match the count used in the thumbnail-generation
+    // LaunchedEffect above.
+    val frameCount = 40
+    val totalStripWidthDp = frameWidthDp * frameCount
+    val filmstripScrollState = rememberScrollState()
+
     Scaffold(
         topBar = {
+            // v0.7.20: Slim top bar (56dp + status bar padding) to match
+            // the WorkshopBrowserScreen — the default 64dp + inset wastes
+            // vertical space on this screen where every pixel matters for
+            // the video preview + filmstrip.
             TopAppBar(
+                modifier = Modifier
+                    .statusBarsPadding()
+                    .height(56.dp),
                 title = { Text("Trim Video", maxLines = 1) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
+                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         },
     ) { padding ->
+        // v0.7.20: Wrap the whole content in verticalScroll so that when
+        // the video preview is tall (portrait videos), the user can scroll
+        // down to reach the filmstrip + buttons. The preview's aspectRatio
+        // is preserved exactly — we just let the content be as tall as it
+        // needs to be and scroll if it overflows.
         Column(
             modifier = Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
                 .padding(padding)
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -270,22 +314,20 @@ fun VideoTrimScreen(
                     color = MaterialTheme.colorScheme.primary)
             }
 
-            // === v0.7.3: Trimmer bar with frames INSIDE the bar ===
-            // Layout (bottom to top in a Box):
-            //   1. Row of 16 frame thumbnails filling the box (the strip
-            //      background — frames ARE the bar, not above it).
-            //   2. Row with three weight-based Boxes: left-dim |
-            //      transparent-selected | right-dim. The dimmed Boxes are
-            //      semi-transparent black overlays covering the frames
-            //      OUTSIDE the selected range (the standard "dim the
-            //      unselected portion" look used by every mobile video
-            //      trimmer — WhatsApp, iMovie, CapCut, etc.).
-            //   3. Material3 RangeSlider on top with transparent track
-            //      colors. The slider's track is invisible (so the frames
-            //      show through); only the two thumb handles are visible,
-            //      sitting on top of the strip at the start/end positions.
-            // The whole Box is clipped to a rounded rectangle for a
-            // nice filmstrip look.
+            // === v0.7.20: Scrollable filmstrip trimmer ===
+            // Layout (bottom to top in a horizontally-scrollable Box):
+            //   1. Row of 40 frame thumbnails, each at a FIXED width derived
+            //      from the video's aspect ratio. The total row width is
+            //      much wider than the screen, so the user scrolls
+            //      horizontally across the strip (like in a real video
+            //      editor — iMovie, CapCut, etc.).
+            //   2. Dim overlays (left/middle/right) on top of the frames,
+            //      spanning the full scrollable width so the dimmed region
+            //      maps correctly to the selected time range.
+            //   3. RangeSlider on top, also spanning the full scrollable
+            //      width, so the thumb handles sit at the correct time
+            //      positions. The slider + dims + frames all scroll
+            //      together as one unit.
             if (durationMs > 0) {
                 val startRange = startMs.toFloat() / durationMs
                 val endRange = endMs.toFloat() / durationMs
@@ -293,108 +335,120 @@ fun VideoTrimScreen(
                 val middleWeight = (endRange - startRange).coerceIn(0f, 1f)
                 val rightDimWeight = (1f - endRange).coerceIn(0f, 1f)
 
+                // The outer Box clips the filmstrip to a rounded rectangle.
+                // The inner Box is horizontally scrollable and contains the
+                // frames + dims + slider at totalStripWidthDp width.
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(72.dp)
+                        .height(filmstripHeight)
                         .clip(RoundedCornerShape(6.dp)),
                 ) {
-                    // 1) Thumbnail strip background (frames ARE the bar)
-                    if (thumbnails.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .horizontalScroll(filmstripScrollState),
+                    ) {
+                        // 1) Thumbnail strip background (frames ARE the bar)
+                        if (thumbnails.isNotEmpty()) {
+                            Row(
+                                modifier = Modifier
+                                    .width(totalStripWidthDp)
+                                    .fillMaxHeight(),
+                                horizontalArrangement = Arrangement.spacedBy(1.dp),
+                            ) {
+                                thumbnails.forEach { bmp ->
+                                    Image(
+                                        bitmap = bmp.asImageBitmap(),
+                                        contentDescription = null,
+                                        contentScale = ContentScale.FillBounds,
+                                        modifier = Modifier
+                                            .width(frameWidthDp)
+                                            .fillMaxHeight(),
+                                    )
+                                }
+                            }
+                        } else {
+                            // Fallback while thumbnails load
+                            Box(
+                                modifier = Modifier
+                                    .width(totalStripWidthDp)
+                                    .fillMaxHeight()
+                                    .background(Color.DarkGray),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                            }
+                        }
+
+                        // 2) Dimmed overlays outside the selected region.
+                        // Three weighted Boxes spanning the full strip width
+                        // — when startRange=0 the left dim is invisible
+                        // (weight 0 = 0 width); same for the right dim when
+                        // endRange=1. The middle Box is transparent so the
+                        // frames show through.
                         Row(
-                            modifier = Modifier.fillMaxSize(),
-                            horizontalArrangement = Arrangement.spacedBy(1.dp),
+                            modifier = Modifier
+                                .width(totalStripWidthDp)
+                                .fillMaxHeight(),
                         ) {
-                            thumbnails.forEach { bmp ->
-                                Image(
-                                    bitmap = bmp.asImageBitmap(),
-                                    contentDescription = null,
-                                    contentScale = ContentScale.FillBounds,
+                            if (leftDimWeight > 0f) {
+                                Box(
                                     modifier = Modifier
-                                        .weight(1f)
-                                        .fillMaxSize(),
+                                        .weight(leftDimWeight)
+                                        .fillMaxHeight()
+                                        .background(Color.Black.copy(alpha = 0.55f)),
+                                )
+                            }
+                            if (middleWeight > 0f) {
+                                Box(modifier = Modifier.weight(middleWeight))
+                            }
+                            if (rightDimWeight > 0f) {
+                                Box(
+                                    modifier = Modifier
+                                        .weight(rightDimWeight)
+                                        .fillMaxHeight()
+                                        .background(Color.Black.copy(alpha = 0.55f)),
                                 )
                             }
                         }
-                    } else {
-                        // Fallback while thumbnails load
-                        Box(
+
+                        // 3) RangeSlider on top — transparent track colors so
+                        //    only the two thumb handles are visible, sitting
+                        //    on top of the strip. The slider spans the full
+                        //    scrollable width so the thumbs map to the correct
+                        //    time positions. As the user scrolls the filmstrip,
+                        //    the slider scrolls with it (thumbs move with the
+                        //    frames). The user drags a thumb by touching it
+                        //    directly; touching elsewhere on the strip scrolls.
+                        RangeSlider(
+                            value = startRange..endRange,
+                            onValueChange = { range ->
+                                // Enforce a 500ms minimum selection so the
+                                // start/end can't collapse onto each other.
+                                val newStart = (range.start * durationMs).toLong()
+                                    .coerceAtMost((endMs - 500).coerceAtLeast(0))
+                                startMs = newStart
+                                val newEnd = (range.endInclusive * durationMs).toLong()
+                                    .coerceAtLeast(newStart + 500).coerceAtMost(durationMs)
+                                endMs = newEnd
+                            },
+                            onValueChangeFinished = {
+                                // Seek the preview to the start handle when the
+                                // user lifts their finger — gives a "preview
+                                // from the trim point" effect.
+                                player.seekTo(startMs)
+                            },
                             modifier = Modifier
-                                .fillMaxSize()
-                                .background(Color.DarkGray),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                        }
+                                .width(totalStripWidthDp)
+                                .align(Alignment.Center),
+                            colors = SliderDefaults.colors(
+                                activeTrackColor = Color.Transparent,
+                                inactiveTrackColor = Color.Transparent,
+                                thumbColor = Color.White,
+                            ),
+                        )
                     }
-
-                    // 2) Dimmed overlays outside the selected region.
-                    // Three weighted Boxes — when startRange=0 the left
-                    // dim is invisible (weight 0 = 0 width); same for the
-                    // right dim when endRange=1. The middle Box is
-                    // transparent so the frames show through.
-                    Row(modifier = Modifier.fillMaxSize()) {
-                        if (leftDimWeight > 0f) {
-                            Box(
-                                modifier = Modifier
-                                    .weight(leftDimWeight)
-                                    .fillMaxHeight()
-                                    .background(Color.Black.copy(alpha = 0.55f)),
-                            )
-                        }
-                        if (middleWeight > 0f) {
-                            Box(modifier = Modifier.weight(middleWeight))
-                        }
-                        if (rightDimWeight > 0f) {
-                            Box(
-                                modifier = Modifier
-                                    .weight(rightDimWeight)
-                                    .fillMaxHeight()
-                                    .background(Color.Black.copy(alpha = 0.55f)),
-                            )
-                        }
-                    }
-
-                    // 3) RangeSlider on top — transparent track colors so
-                    //    only the two thumb handles are visible, sitting
-                    //    on top of the strip. The handles' positions match
-                    //    the dimmed-overlay boundaries (modulo the slider's
-                    //    internal half-thumb padding, which is small and
-                    //    visually unnoticeable on a 72dp-tall strip).
-                    RangeSlider(
-                        value = startRange..endRange,
-                        onValueChange = { range ->
-                            // Enforce a 500ms minimum selection so the
-                            // start/end can't collapse onto each other.
-                            // v0.7.4: newEnd is clamped against the NEW start,
-                            // not the OLD one. The old order clamped newEnd to
-                            // `startMs + 500` BEFORE startMs was updated, so
-                            // dragging the start thumb towards the end made the
-                            // end thumb visibly snap back on the next frame.
-                            val newStart = (range.start * durationMs).toLong()
-                                .coerceAtMost((endMs - 500).coerceAtLeast(0))
-                            startMs = newStart
-                            val newEnd = (range.endInclusive * durationMs).toLong()
-                                .coerceAtLeast(newStart + 500).coerceAtMost(durationMs)
-                            endMs = newEnd
-                        },
-                        onValueChangeFinished = {
-                            // Seek the preview to the start handle when the
-                            // user lifts their finger — gives a "preview
-                            // from the trim point" effect.
-                            player.seekTo(startMs)
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.Center),
-                        colors = SliderDefaults.colors(
-                            // Both tracks transparent so the frames show
-                            // through; only the thumbs (white) are visible.
-                            activeTrackColor = Color.Transparent,
-                            inactiveTrackColor = Color.Transparent,
-                            thumbColor = Color.White,
-                        ),
-                    )
                 }
             } else {
                 CircularProgressIndicator(modifier = Modifier.size(32.dp))
@@ -415,7 +469,10 @@ fun VideoTrimScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
-            Spacer(Modifier.weight(1f))
+            // v0.7.20: Fixed spacer (was Modifier.weight(1f) which doesn't
+            // work inside a verticalScroll — the column has unbounded height
+            // so weight has no meaning).
+            Spacer(Modifier.height(16.dp))
 
             // === Trim & Send + Send Full Video side by side ===
             // Both buttons in a single Row (side by side, not stacked
@@ -463,7 +520,7 @@ fun VideoTrimScreen(
                                     // after we pop back — and so a second "Trim
                                     // Video" tap can't navigate here with a path to
                                     // a file we just deleted (stuck spinner).
-                                    com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen()
+                                    com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen(itemId)
                                     WepWawetLogger.workshop("VideoTrimScreen: trim + send complete",
                                         "item_id" to itemId, "mpkg_size" to mpkgFile.length())
                                     isTrimming = false
@@ -510,7 +567,7 @@ fun VideoTrimScreen(
                                     // v0.7.4: same install-dir cleanup + pending-state
                                     // clear as the trim path.
                                     runCatching { installDir.deleteRecursively() }
-                                    com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen()
+                                    com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen(itemId)
                                     isTrimming = false
                                     onSendComplete()
                                 } catch (e: kotlinx.coroutines.CancellationException) {

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
@@ -172,7 +174,9 @@ fun WallpaperDetailScreen(
     //     survives the user navigating away from this screen. The previous
     //     implementation used rememberCoroutineScope() which was cancelled when
     //     the composable left composition, killing the download mid-flight. ===
-    val downloadState by com.wepwawet.pairing.WorkshopDownloadJob.state.collectAsState()
+    // v0.7.20: Observe per-item state so concurrent downloads don't interfere
+    // — each detail screen only sees its own item's download progress/status.
+    val downloadState by com.wepwawet.pairing.WorkshopDownloadJob.stateFor(itemId).collectAsState()
     val creatorNames by repo.creatorNames.collectAsState()
     // True if THIS screen's item is the one currently being downloaded.
     val isThisItemDownloading = downloadState.isRunning &&
@@ -226,12 +230,16 @@ fun WallpaperDetailScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier
+                    .statusBarsPadding()
+                    .height(56.dp),
                 title = { Text(item?.title ?: "Loading…", maxLines = 1) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
                     }
-                }
+                },
+                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         },
         // v0.7.1: SnackbarHost bound to the Scaffold so "favorited <creator>"
@@ -637,7 +645,7 @@ fun WallpaperDetailScreen(
     if (pendingVideoFile != null && pendingVideoItem != null) {
         androidx.compose.material3.AlertDialog(
             onDismissRequest = {
-                com.wepwawet.pairing.WorkshopDownloadJob.cancelVideoSend()
+                com.wepwawet.pairing.WorkshopDownloadJob.cancelVideoSend(itemId)
             },
             title = {
                 Row(
@@ -648,7 +656,7 @@ fun WallpaperDetailScreen(
                     Text("Video Downloaded")
                     IconButton(
                         onClick = {
-                            com.wepwawet.pairing.WorkshopDownloadJob.cancelVideoSend()
+                            com.wepwawet.pairing.WorkshopDownloadJob.cancelVideoSend(itemId)
                         },
                         modifier = Modifier.size(32.dp),
                     ) {
@@ -674,7 +682,7 @@ fun WallpaperDetailScreen(
                     ) { Text("Trim Video") }
                     androidx.compose.material3.TextButton(
                         onClick = {
-                            com.wepwawet.pairing.WorkshopDownloadJob.continueVideoSend(context)
+                            com.wepwawet.pairing.WorkshopDownloadJob.continueVideoSend(context, itemId)
                         },
                     ) { Text("Send Full Video") }
                 }

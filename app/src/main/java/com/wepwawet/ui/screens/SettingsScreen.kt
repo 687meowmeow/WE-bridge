@@ -6,9 +6,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
@@ -204,6 +206,9 @@ fun SettingsScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier
+                    .statusBarsPadding()
+                    .height(56.dp),
                 title = { Text("Settings") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
@@ -216,6 +221,7 @@ fun SettingsScreen(
                         Icon(Icons.Filled.BugReport, contentDescription = "Logs")
                     }
                 },
+                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         }
     ) { innerPadding ->
@@ -857,7 +863,10 @@ private fun CacheCard(context: Context) {
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                "Clears downloaded .pkg files, .mpkg files, and texture conversion cache.",
+                // v0.7.20: .mpkg files are NOT cached (they are packed on-demand
+                // and queued for transfer, then deleted). Only .pkg files and the
+                // texture conversion cache are cleared here.
+                "Clears downloaded .pkg files and texture conversion cache.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

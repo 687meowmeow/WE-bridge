@@ -373,8 +373,39 @@ android {
         //   g_Texture2 (waterflowphase.tex) .r → flowPhase → smoothstep(0.2,0.8,
         //   flowPhase) → mix(flowAlbedo, flowAlbedo2, ...) — the .r channel
         //   MUST be precise for smooth animation.
-        versionCode = 111
-        versionName = "0.7.19-alpha"
+        // v0.7.20-alpha: UI/UX polish + concurrent downloads.
+        //   - Foreground notification hardened: setOngoing + setShowWhen(false) +
+        //     setForegroundServiceBehavior(IMMEDIATE) + setOnlyAlertOnce +
+        //     CATEGORY_SERVICE + VISIBILITY_PUBLIC + content-tap opens MainActivity.
+        //     The notification persists while the proxy runs and re-posts if the
+        //     user swipes it away on Android 14+ (specialUse FGS type has no
+        //     system timeout per the Android docs — only dataSync and
+        //     mediaProcessing have the 6-hour limit).
+        //   - WorkshopBrowser: scroll position + page number now survive
+        //     navigation to a wallpaper detail and back (rememberSaveable with
+        //     LazyGridState.Saver + mutableIntStateOf for lastSeenPage). The old
+        //     rememberLazyGridState() was destroyed on every navigation, snapping
+        //     back to the top.
+        //   - VideoTrim: filmstrip is now horizontally scrollable with 40 frames
+        //     (was fixed 16 squashed into screen width). Each frame is at the
+        //     video's true aspect ratio. The whole screen is vertically scrollable
+        //     so tall (portrait) videos don't push the trim controls off-screen.
+        //     The RangeSlider + dim overlays span the full scrollable width so
+        //     the selection maps correctly to the timeline.
+        //   - All non-main screens: TopAppBar slimmed from default 64dp + status
+        //     bar inset to 56dp + statusBarsPadding (matches WorkshopBrowserScreen).
+        //     Affected: WallpaperDetail, Favorites, Settings, DownloadManager,
+        //     Logs, Pairing, VideoTrim.
+        //   - Concurrent downloads: WorkshopDownloadJob refactored from a single
+        //     Job? + isRunning guard to a per-item ConcurrentHashMap<String, Job>
+        //     + MutableStateFlow<Map<String, State>>. Multiple wallpapers can now
+        //     download at the same time. The detail screen observes stateFor(itemId)
+        //     so each screen only sees its own item's progress. cancel(itemId)
+        //     cancels a specific download; cancel() cancels all.
+        //   - SettingsScreen: removed ".mpkg" from the Clear Cache description
+        //     (.mpkg files are packed on-demand and queued, not cached).
+        versionCode = 112
+        versionName = "0.7.20-alpha"
         // Native ABI filter — only build for arm64-v8a (WE app targets Snapdragon 8 Gen 2+)
         ndk {
             abiFilters += "arm64-v8a"

@@ -211,7 +211,7 @@ fun WepWawetNavHost() {
         }
 
         // Video trim route — only passes itemId + title (URL-encoded).
-        // The video file path is read from WorkshopDownloadJob.state.pendingVideoFile
+        // The video file path is read from WorkshopDownloadJob.pendingVideoFor(itemId)
         // (not passed as a nav arg, because file paths contain slashes that
         // break Jetpack Navigation's path segment parsing).
         composable(
@@ -224,9 +224,11 @@ fun WepWawetNavHost() {
             val trimItemId = entry.arguments?.getString("itemId").orEmpty()
             val trimItemTitle = java.net.URLDecoder.decode(
                 entry.arguments?.getString("itemTitle").orEmpty(), "UTF-8")
-            // Read the video file path from the shared state (set by
-            // WorkshopDownloadJob before showing the trim dialog).
-            val trimVideoPath = com.wepwawet.pairing.WorkshopDownloadJob.state.value.pendingVideoFile
+            // v0.7.20: Read the video file path from the per-item state (was
+            // WorkshopDownloadJob.state.value.pendingVideoFile which under
+            // concurrent downloads could read the wrong item's pending video).
+            val trimVideoPath = com.wepwawet.pairing.WorkshopDownloadJob
+                .pendingVideoFor(trimItemId)?.first
             WepWawetLogger.lifecycle("NavHost navigate to videoTrim",
                 "item_id" to trimItemId,
                 "video_path" to (trimVideoPath ?: "null"),

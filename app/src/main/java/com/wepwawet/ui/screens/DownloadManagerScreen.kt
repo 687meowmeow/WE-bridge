@@ -8,11 +8,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -91,6 +93,9 @@ fun DownloadManagerScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                modifier = Modifier
+                    .statusBarsPadding()
+                    .height(56.dp),
                 title = { Text("Downloads") },
                 navigationIcon = {
                     IconButton(onClick = {
@@ -113,6 +118,7 @@ fun DownloadManagerScreen(
                         }
                     }
                 },
+                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         },
     ) { padding ->
@@ -231,7 +237,9 @@ private fun ActiveDownloadCard(download: DownloadProgress, onItemClick: (String)
                 // coroutine (running on WepWawetApplication.appScope) — otherwise
                 // the JavaSteam download keeps going in the background even
                 // after the user removes the entry from the active list.
-                com.wepwawet.pairing.WorkshopDownloadJob.cancel()
+                // v0.7.20: cancel the SPECIFIC item's job (was cancel() which
+                // cancelled ALL concurrent downloads).
+                com.wepwawet.pairing.WorkshopDownloadJob.cancel(download.itemId)
                 DownloadManager.cancelDownload(download.itemId)
             }) {
                 Icon(

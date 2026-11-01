@@ -8,15 +8,19 @@ import com.wepwawet.log.WepWawetLogger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Singleton holding the state of an in-flight (or last-completed) workshop
- * download. The state is exposed as a [StateFlow] so any Composable can
+ * Singleton holding the state of in-flight (or last-completed) workshop
+ * downloads. The state is exposed as a [StateFlow] so any Composable can
  * observe it — including after the user has navigated away from the screen
  * that originally started the download.
  *
@@ -27,8 +31,13 @@ import java.io.File
  *  - Come back later and the download will either still be running, or have
  *    finished and saved the .mpkg to Downloads.
  *
- * Only ONE download at a time is allowed — calling [launchDebugDownload] while
- * another is running will fail-fast with `isRunning = true`.
+ * v0.7.20: CONCURRENT DOWNLOADS — multiple downloads can now run at the
+ * same time. The old singleton had a single `Job?` + `State.isRunning`
+ * guard that serialized all downloads (launching a second while the first
+ * was running was rejected). Now each item has its own [State] in
+ * [_states] and its own [Job] in [jobs], keyed by workshop item ID. The
+ * detail screen observes [stateFor] for its specific item, so the
+ * "Send to phone" button is enabled per-item (not globally).
  */
 object WorkshopDownloadJob {
 
@@ -79,7 +88,60 @@ object WorkshopDownloadJob {
     private val _state = MutableStateFlow(State())
     val state: StateFlow<State> = _state.asStateFlow()
 
-    private var job: Job? = null
+    // v0.7.20: Per-item state map for concurrent downloads. Each item gets
+    // its own State entry, so the detail screen can observe just its item's
+    // download progress without being affected by other concurrent downloads.
+    private val _states = MutableStateFlow<Map<String, State>>(emptyMap())
+    val states: StateFlow<Map<String, State>> = _states.asStateFlow()
+
+    // v0.7.20: Per-item job map. Each concurrent download has its own Job,
+    // keyed by workshop item ID. Replaced the old single `private var job:
+    // Job?` that serialized all downloads.
+    private val jobs = ConcurrentHashMap<String, Job>()
+
+    // v0.7.20: Cached StateFlows for stateFor() — creating a new StateFlow
+    // per recomposition would leak, so we cache one per item ID.
+    private val stateFlows = ConcurrentHashMap<String, StateFlow<State>>()
+
+    /**
+     * v0.7.20: Returns a [StateFlow] for a specific workshop item's download
+     * state. The detail screen calls this to observe per-item progress /
+     * status / pending-video state. Multiple concurrent downloads each have
+     * their own independent state flow.
+     */
+    fun stateFor(itemId: String): StateFlow<State> =
+        stateFlows.computeIfAbsent(itemId) { id ->
+            _states
+                .map { it[id] ?: State() }
+                .stateIn(WepWawetApplication.appScope, SharingStarted.Eagerly, State())
+        }
+
+    /**
+     * v0.7.20: Returns the pending video file path + item for a specific
+     * workshop item, or null if the item has no pending video. Used by the
+     * NavHost when navigating to the VideoTrimScreen (the video file path
+     * can't be passed as a nav arg because paths contain slashes).
+     */
+    fun pendingVideoFor(itemId: String): Pair<String, WorkshopItemTyped>? {
+        val s = _states.value[itemId] ?: return null
+        val path = s.pendingVideoFile ?: return null
+        val item = s.pendingVideoItem ?: return null
+        return path to item
+    }
+
+    /**
+     * v0.7.20: Update a specific item's state. Also mirrors the update to
+     * the legacy [_state] for backwards-compat callers that still read
+     * `WorkshopDownloadJob.state`.
+     */
+    private fun updateState(itemId: String, update: (State) -> State) {
+        _states.update { current ->
+            val existing = current[itemId] ?: State(workshopId = itemId)
+            current + (itemId to update(existing))
+        }
+        // Mirror to legacy single-state for any code that still reads _state
+        _state.value = _states.value[itemId] ?: State()
+    }
 
     // === v0.5.9-alpha (R8 fix): mirror state into DownloadManager so the
     //     Downloads screen + WallpaperCard "Downloading…" overlay + "✓" badge
@@ -157,8 +219,9 @@ object WorkshopDownloadJob {
     /**
      * Start (or queue) the "Save .mpkg to Downloads (debug)" download.
      *
-     * Returns `false` if another download is already running (caller should
-     * show a "download in progress" toast or just ignore the tap).
+     * v0.7.20: Returns `false` if THIS ITEM already has a download running
+     * (other items can download concurrently). The caller should show a
+     * "this item is already downloading" toast or just ignore the tap.
      *
      * @param context app/context (used for cache dir, Steam credentials)
      * @param item workshop item to download
@@ -168,11 +231,12 @@ object WorkshopDownloadJob {
         context: Context,
         item: WorkshopItemTyped,
     ): Boolean {
-        val current = _state.value
-        if (current.isRunning) {
-            WepWawetLogger.workshop("WorkshopDownloadJob: launch rejected — already running",
-                "current_id" to (current.workshopId ?: "null"),
-                "requested_id" to item.id)
+        val itemId = item.id
+        // v0.7.20: Per-item guard — only reject if THIS item is already
+        // downloading. Other items can download concurrently.
+        if (jobs[itemId]?.isActive == true) {
+            WepWawetLogger.workshop("WorkshopDownloadJob: launch rejected — this item already running",
+                "requested_id" to itemId)
             return false
         }
 
@@ -180,7 +244,7 @@ object WorkshopDownloadJob {
         val steamUser = SteamCredentialsStore.getUsername(appContext)
         val steamPass = SteamCredentialsStore.getPassword(appContext)
         if (steamUser == null || steamPass == null) {
-            _state.update { it.copy(
+            updateState(itemId) { it.copy(
                 errorMessage = "Steam login not set. Open Settings → Steam account first.",
                 endedAt = System.currentTimeMillis(),
             ) }
@@ -188,14 +252,14 @@ object WorkshopDownloadJob {
         }
 
         val sendId = System.currentTimeMillis()
-        val pkgFile = File(appContext.cacheDir, "${item.id}_${sendId}_debug.pkg")
+        val pkgFile = File(appContext.cacheDir, "${itemId}_${sendId}_debug.pkg")
         val downloader = WorkshopDownloader(steamUser, steamPass)
 
-        _state.update { it.copy(
+        updateState(itemId) { it.copy(
             isRunning = true,
             progress = 0f,
             status = "Downloading real .pkg via JavaSteam (debug)…",
-            workshopId = item.id,
+            workshopId = itemId,
             workshopTitle = item.title,
             resultMessage = null,
             errorMessage = null,
@@ -214,11 +278,11 @@ object WorkshopDownloadJob {
         onDownloadStarted(item)
 
         WepWawetLogger.workshop("WorkshopDownloadJob: launching debug download",
-            "id" to item.id,
+            "id" to itemId,
             "title" to item.title.take(80),
             "pkg_cache_path" to pkgFile.absolutePath)
 
-        job = WepWawetApplication.appScope.launchSafely {
+        jobs[itemId] = WepWawetApplication.appScope.launchSafely(itemId) {
             var downloaderRef: WorkshopDownloader? = downloader
             try {
                 WepWawetLogger.workshop("WorkshopDownloadJob: coroutine STARTED",
@@ -238,7 +302,7 @@ object WorkshopDownloadJob {
                     "id" to item.id,
                     "path" to cachedPkg.absolutePath,
                     "size" to cachedPkg.length())
-                _state.update { s -> s.copy(status = "Using cached .pkg — packing…") }
+                updateState(itemId) { s -> s.copy(status = "Using cached .pkg — packing…") }
                 cachedPkg
             } else {
             downloader.downloadWorkshopPkg(
@@ -247,7 +311,7 @@ object WorkshopDownloadJob {
                 outputFile = pkgFile,
                 onProgress = { pct ->
                     val coerced = pct.coerceIn(0f, 1f)
-                    _state.update { s -> s.copy(
+                    updateState(itemId) { s -> s.copy(
                         progress = coerced,
                         hasChunkProgress = true,
                     ) }
@@ -276,13 +340,15 @@ object WorkshopDownloadJob {
                     }
                 },
                 onStatusUpdate = { status ->
-                    _state.update { s -> s.copy(status = status) }
+                    updateState(itemId) { s -> s.copy(status = status) }
                     // v0.5.32 (audit §1): mirror the status string too so
                     // the Downloads screen's statusMessage text stays in
                     // sync with the detail screen.
                     onDownloadProgress(
                         itemId = item.id,
-                        progress = _state.value.progress,
+                        // v0.7.20: read per-item progress (was _state.value.progress
+                        // which under concurrent downloads would read the wrong item).
+                        progress = _states.value[itemId]?.progress ?: 0f,
                         status = com.wepwawet.data.DownloadStatus.DOWNLOADING,
                         statusMessage = status,
                     )
@@ -303,7 +369,7 @@ object WorkshopDownloadJob {
                 val err = "Failed to download .pkg via Steam (see logs)"
                 WepWawetLogger.workshopWarn("WorkshopDownloadJob: pkg download failed/null",
                     "id" to item.id)
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     status = err,
                     errorMessage = err,
@@ -313,7 +379,7 @@ object WorkshopDownloadJob {
                 return@launchSafely
             }
 
-            _state.update { s -> s.copy(status = "Packing content → .mpkg…", progress = 0.85f) }
+            updateState(itemId) { s -> s.copy(status = "Packing content → .mpkg…", progress = 0.85f) }
             // v0.5.32 (audit §1): mirror the packing phase transition.
             onDownloadProgress(
                 itemId = item.id,
@@ -394,7 +460,7 @@ object WorkshopDownloadJob {
                     WepWawetLogger.workshopWarn("WorkshopDownloadJob: pack failed",
                         "exception" to e.javaClass.name, "message" to (e.message ?: ""),
                         "is_video" to isVideo)
-                    _state.update { s -> s.copy(
+                    updateState(itemId) { s -> s.copy(
                         isRunning = false,
                         status = err,
                         errorMessage = err,
@@ -424,7 +490,7 @@ object WorkshopDownloadJob {
                     "size" to mpkgSize,
                     "exists" to cacheMpkg.exists(),
                     "pkg_input_size" to downloadedPkg.length())
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     status = err,
                     errorMessage = err,
@@ -435,7 +501,7 @@ object WorkshopDownloadJob {
                 return@launchSafely
             }
 
-            _state.update { s -> s.copy(status = "Saving to Downloads…", progress = 0.95f) }
+            updateState(itemId) { s -> s.copy(status = "Saving to Downloads…", progress = 0.95f) }
             // v0.5.32 (audit §1): mirror the "saving to Downloads" phase
             // transition so the Downloads screen shows what's happening
             // (otherwise it would still show "Packing content → .mpkg…"
@@ -453,7 +519,7 @@ object WorkshopDownloadJob {
                 val err = "Failed to read packed .mpkg: ${e.message}"
                 WepWawetLogger.workshopWarn("WorkshopDownloadJob: read failed",
                     "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     status = err,
                     errorMessage = err,
@@ -502,7 +568,7 @@ object WorkshopDownloadJob {
                     "file" to downloadsName,
                     "size" to bytes.size,
                     "uri" to uri.toString())
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     progress = 1f,
                     status = msg,
@@ -514,7 +580,7 @@ object WorkshopDownloadJob {
                 onDownloadCompleted(item, bytes.size.toLong(), "Downloads")
             } else {
                 val err = "Failed to write .mpkg to Downloads (see logs)"
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     status = err,
                     errorMessage = err,
@@ -568,11 +634,10 @@ object WorkshopDownloadJob {
         context: Context,
         item: WorkshopItemTyped,
     ): Boolean {
-        val current = _state.value
-        if (current.isRunning) {
-            WepWawetLogger.workshop("WorkshopDownloadJob: launch rejected — already running",
-                "current_id" to (current.workshopId ?: "null"),
-                "requested_id" to item.id)
+        val itemId = item.id
+        if (jobs[itemId]?.isActive == true) {
+            WepWawetLogger.workshop("WorkshopDownloadJob: launch rejected — this item already running",
+                "requested_id" to itemId)
             return false
         }
 
@@ -580,14 +645,14 @@ object WorkshopDownloadJob {
         val steamUser = SteamCredentialsStore.getUsername(appContext)
         val steamPass = SteamCredentialsStore.getPassword(appContext)
         if (steamUser == null || steamPass == null) {
-            _state.update { it.copy(
+            updateState(itemId) { it.copy(
                 errorMessage = "Steam login not set. Open Settings → Steam account first.",
                 endedAt = System.currentTimeMillis(),
             ) }
             return false
         }
         if (!PairingService.isPaired()) {
-            _state.update { it.copy(
+            updateState(itemId) { it.copy(
                 errorMessage = "Not paired — open the Pairing tab first.",
                 endedAt = System.currentTimeMillis(),
             ) }
@@ -598,7 +663,7 @@ object WorkshopDownloadJob {
         val pkgFile = File(appContext.cacheDir, "${item.id}_${sendId}_send.pkg")
         val downloader = WorkshopDownloader(steamUser, steamPass)
 
-        _state.update { it.copy(
+        updateState(itemId) { it.copy(
             isRunning = true,
             progress = 0f,
             status = "Sending to phone — downloading real .pkg via JavaSteam…",
@@ -627,7 +692,7 @@ object WorkshopDownloadJob {
             "pkg_cache_path" to pkgFile.absolutePath,
             "paired_device" to (PairingService.pairedDeviceName ?: "null"))
 
-        job = WepWawetApplication.appScope.launchSafely {
+        jobs[itemId] = WepWawetApplication.appScope.launchSafely(itemId) {
             var downloaderRef: WorkshopDownloader? = downloader
             try {
                 WepWawetLogger.workshop("WorkshopDownloadJob.send: coroutine STARTED",
@@ -651,7 +716,7 @@ object WorkshopDownloadJob {
                         "id" to item.id,
                         "path" to cachedPkg.absolutePath,
                         "size" to cachedPkg.length())
-                    _state.update { s -> s.copy(status = "Using cached .pkg — packing…") }
+                    updateState(itemId) { s -> s.copy(status = "Using cached .pkg — packing…") }
                     cachedPkg
                 } else {
                     downloader.downloadWorkshopPkg(
@@ -660,7 +725,7 @@ object WorkshopDownloadJob {
                     outputFile = pkgFile,
                     onProgress = { pct ->
                         val coerced = pct.coerceIn(0f, 1f)
-                        _state.update { s -> s.copy(
+                        updateState(itemId) { s -> s.copy(
                             progress = (coerced * 0.8f),
                             hasChunkProgress = true,
                         ) }
@@ -684,11 +749,12 @@ object WorkshopDownloadJob {
                         }
                     },
                     onStatusUpdate = { status ->
-                        _state.update { s -> s.copy(status = status) }
+                        updateState(itemId) { s -> s.copy(status = status) }
                         // v0.5.32 (audit §1): mirror the status string too.
                         onDownloadProgress(
                             itemId = item.id,
-                            progress = _state.value.progress,
+                            // v0.7.20: read per-item progress (was _state.value.progress).
+                            progress = _states.value[itemId]?.progress ?: 0f,
                             status = com.wepwawet.data.DownloadStatus.DOWNLOADING,
                             statusMessage = status,
                         )
@@ -707,7 +773,7 @@ object WorkshopDownloadJob {
                     val err = "Failed to download .pkg via Steam (see logs)"
                     WepWawetLogger.workshopWarn("WorkshopDownloadJob.send: pkg download failed/null",
                         "id" to item.id)
-                    _state.update { s -> s.copy(
+                    updateState(itemId) { s -> s.copy(
                         isRunning = false,
                         status = err,
                         errorMessage = err,
@@ -729,7 +795,7 @@ object WorkshopDownloadJob {
                 //   - MP4 files have "ftyp" at offset 4
                 //   - PKGV (.pkg) files have "PKGV" at offset 4
                 // ===
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     status = "Packing content → .mpkg (might take a while)…",
                     progress = 0.85f,
                 ) }
@@ -770,7 +836,7 @@ object WorkshopDownloadJob {
                 //   c) Tap "Cancel" → call cancelVideoSend() which deletes
                 //      the downloaded file and resets state.
                 if (isVideo) {
-                    _state.update { s -> s.copy(
+                    updateState(itemId) { s -> s.copy(
                         isRunning = false,  // Not "running" anymore — waiting for user decision
                         status = "Video downloaded — do you want to trim?",
                         progress = 0.85f,
@@ -843,7 +909,7 @@ object WorkshopDownloadJob {
                         WepWawetLogger.workshopWarn("WorkshopDownloadJob.send: pack failed",
                             "exception" to e.javaClass.name, "message" to (e.message ?: ""),
                             "is_video" to isVideo)
-                        _state.update { s -> s.copy(
+                        updateState(itemId) { s -> s.copy(
                             isRunning = false,
                             status = err,
                             errorMessage = err,
@@ -870,7 +936,7 @@ object WorkshopDownloadJob {
                     val err = "Failed to pack .pkg → .mpkg (empty output)"
                     WepWawetLogger.workshopWarn("WorkshopDownloadJob.send: empty mpkg output",
                         "size" to mpkgSize, "exists" to cacheMpkg.exists())
-                    _state.update { s -> s.copy(
+                    updateState(itemId) { s -> s.copy(
                         isRunning = false,
                         status = err,
                         errorMessage = err,
@@ -882,7 +948,7 @@ object WorkshopDownloadJob {
                 }
 
                 // === Queue for transfer to phone ===
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     status = "Queuing for transfer to phone…",
                     progress = 0.95f,
                 ) }
@@ -961,7 +1027,7 @@ object WorkshopDownloadJob {
                     "file" to cacheMpkg.name,
                     "size" to cacheMpkg.length(),
                     "device" to deviceName)
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     progress = 1f,
                     status = msg,
@@ -992,11 +1058,12 @@ object WorkshopDownloadJob {
      * Packs the downloaded video into a .mpkg and queues it for transfer
      * — exactly the same code as the normal send-to-phone flow for video.
      */
-    fun continueVideoSend(context: Context) {
-        val pendingFile = _state.value.pendingVideoFile
-        val pendingItem = _state.value.pendingVideoItem
+    fun continueVideoSend(context: Context, itemId: String) {
+        val pendingFile = _states.value[itemId]?.pendingVideoFile
+        val pendingItem = _states.value[itemId]?.pendingVideoItem
         if (pendingFile == null || pendingItem == null) {
             WepWawetLogger.workshopWarn("WorkshopDownloadJob.continueVideoSend: no pending video",
+                "id" to itemId,
                 "pending_file" to (pendingFile ?: "null"))
             return
         }
@@ -1005,7 +1072,7 @@ object WorkshopDownloadJob {
         if (!videoFile.exists()) {
             WepWawetLogger.workshopWarn("WorkshopDownloadJob.continueVideoSend: video file gone",
                 "path" to pendingFile)
-            _state.update { it.copy(
+            updateState(itemId) { it.copy(
                 pendingVideoFile = null,
                 pendingVideoItem = null,
                 errorMessage = "Video file not found",
@@ -1013,7 +1080,7 @@ object WorkshopDownloadJob {
             return
         }
         // Clear the pending state — we're resuming
-        _state.update { it.copy(
+        updateState(itemId) { it.copy(
             pendingVideoFile = null,
             pendingVideoItem = null,
             isRunning = true,
@@ -1022,7 +1089,7 @@ object WorkshopDownloadJob {
         val sendId = System.currentTimeMillis()
         val cacheMpkg = File(appContext.cacheDir, "${pendingItem.id}_${sendId}_send.mpkg")
         val installDir = File(appContext.cacheDir, "workshop_downloads/${pendingItem.id}")
-        job = WepWawetApplication.appScope.launchSafely {
+        jobs[itemId] = WepWawetApplication.appScope.launchSafely(itemId) {
             try {
                 val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
                 val wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WepWawet:MpkgPacker")
@@ -1043,7 +1110,7 @@ object WorkshopDownloadJob {
                     if (wakeLock.isHeld) wakeLock.release()
                 }
                 // Queue for transfer
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     status = "Queuing for transfer…",
                     progress = 0.95f,
                 ) }
@@ -1066,7 +1133,7 @@ object WorkshopDownloadJob {
                 val msg = "Queued ${formatBytes(cacheMpkg.length())} for transfer to $deviceName"
                 WepWawetLogger.workshop("WorkshopDownloadJob.continueVideoSend: QUEUED",
                     "file" to cacheMpkg.name, "size" to cacheMpkg.length())
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     progress = 1f,
                     status = msg,
@@ -1079,7 +1146,7 @@ object WorkshopDownloadJob {
             } catch (e: Exception) {
                 WepWawetLogger.workshopWarn("WorkshopDownloadJob.continueVideoSend: failed",
                     "exception" to e.javaClass.name, "message" to (e.message ?: ""))
-                _state.update { s -> s.copy(
+                updateState(itemId) { s -> s.copy(
                     isRunning = false,
                     status = "Failed: ${e.message}",
                     errorMessage = "Failed: ${e.message}",
@@ -1111,12 +1178,11 @@ object WorkshopDownloadJob {
      * screen show a frozen 85% bar), and clear any stale result/error
      * messages so a fresh send-to-phone starts clean.
      */
-    fun cancelVideoSend() {
-        val pendingFile = _state.value.pendingVideoFile
-        val workshopId = _state.value.workshopId
+    fun cancelVideoSend(itemId: String) {
+        val pendingFile = _states.value[itemId]?.pendingVideoFile
         WepWawetLogger.workshop("WorkshopDownloadJob.cancelVideoSend",
-            "pending_file" to (pendingFile ?: "null"),
-            "workshop_id" to (workshopId ?: "null"))
+            "id" to itemId,
+            "pending_file" to (pendingFile ?: "null"))
         if (pendingFile != null) {
             runCatching { File(pendingFile).delete() }
         }
@@ -1124,8 +1190,8 @@ object WorkshopDownloadJob {
         // screen's entry for this item is removed — otherwise it stays
         // in activeDownloads with the stale "waiting for trim decision"
         // statusMessage and 85% progress until the next event clears it.
-        onDownloadCancelled(workshopId)
-        _state.update { it.copy(
+        onDownloadCancelled(itemId)
+        updateState(itemId) { it.copy(
             isRunning = false,
             pendingVideoFile = null,
             pendingVideoItem = null,
@@ -1147,9 +1213,10 @@ object WorkshopDownloadJob {
      * dialog doesn't reappear after navigating back, and a second "Trim Video"
      * tap can't navigate to a file that was already consumed.
      */
-    fun onVideoConsumedByTrimScreen() {
-        if (_state.value.pendingVideoFile != null || _state.value.pendingVideoItem != null) {
-            _state.update { it.copy(
+    fun onVideoConsumedByTrimScreen(itemId: String) {
+        val s = _states.value[itemId]
+        if (s?.pendingVideoFile != null || s?.pendingVideoItem != null) {
+            updateState(itemId) { it.copy(
                 pendingVideoFile = null,
                 pendingVideoItem = null,
             ) }
@@ -1158,21 +1225,22 @@ object WorkshopDownloadJob {
     }
 
     fun cancel() {
+        val allIds = jobs.keys.toList()
+        WepWawetLogger.workshop("WorkshopDownloadJob: cancelling all",
+            "count" to allIds.size)
+        allIds.forEach { id -> cancel(id) }
+    }
+
+    fun cancel(itemId: String) {
         WepWawetLogger.workshop("WorkshopDownloadJob: cancelling",
-            "id" to (_state.value.workshopId ?: "null"))
-        // v0.5.9-alpha (R8): mirror the cancel into DownloadManager so the
-        // Downloads screen "Cancel" button works (it calls WorkshopDownloadJob.cancel
-        // via the DownloadManagerScreen → activeDownloads subscription).
-        onDownloadCancelled(_state.value.workshopId)
-        job?.cancel()
-        job = null
-        _state.update { s -> s.copy(
+            "id" to itemId)
+        jobs[itemId]?.cancel()
+        jobs.remove(itemId)
+        onDownloadCancelled(itemId)
+        updateState(itemId) { it.copy(
             isRunning = false,
             status = "Cancelled",
             errorMessage = "Cancelled",
-            // v0.7.4: reset progress so the Downloads screen doesn't show a
-            // frozen progress bar at whatever percentage the download was at
-            // when cancelled (cancelVideoSend already did this; cancel didn't).
             progress = 0f,
             endedAt = System.currentTimeMillis(),
         ) }
@@ -1181,11 +1249,10 @@ object WorkshopDownloadJob {
     /** Mark the current download as failed with the given message. Called by
      *  [launchSafely] if the coroutine throws — keeps the UI from hanging on
      *  "Running…" forever after a crash. */
-    fun markCrashed(message: String) {
+    fun markCrashed(itemId: String, message: String) {
         WepWawetLogger.workshopWarn("WorkshopDownloadJob: coroutine crashed",
             "msg" to message)
-        val crashedItemId = _state.value.workshopId
-        _state.update { s -> s.copy(
+        updateState(itemId) { s -> s.copy(
             isRunning = false,
             status = message,
             errorMessage = message,
@@ -1193,17 +1260,23 @@ object WorkshopDownloadJob {
         ) }
         // v0.5.9-alpha (R8): mirror the crash into DownloadManager so the
         // Downloads screen shows the failure instead of a stale "Downloading…".
-        // Only fire if we have a workshopId (otherwise the crash happened
-        // before any launch started, which shouldn't happen, but be safe).
-        if (crashedItemId != null) {
-            com.wepwawet.data.DownloadManager.failDownload(
-                crashedItemId, "Coroutine crashed: $message")
-        }
+        com.wepwawet.data.DownloadManager.failDownload(itemId, "Coroutine crashed: $message")
     }
 
     /** Reset to a clean idle state (called by UI when user dismisses the result). */
     fun reset() {
         _state.value = State()
+    }
+
+    /**
+     * v0.7.20: Reset a specific item's download state — removes its entry
+     * from the per-item [_states] map and drops its cached StateFlow so a
+     * future call to [stateFor] for this item starts fresh. Called by the
+     * UI when the user dismisses a single item's result panel.
+     */
+    fun reset(itemId: String) {
+        _states.update { it - itemId }
+        stateFlows.remove(itemId)
     }
 
     private fun formatBytes(bytes: Long): String = when {
@@ -1284,7 +1357,7 @@ private fun detectImageByMagicBytes(file: File): Boolean {
  * the [WorkshopDownloadJob] state (so a crash doesn't leave the UI showing
  * "Running…" forever).
  */
-private fun CoroutineScope.launchSafely(block: suspend CoroutineScope.() -> Unit): Job =
+private fun CoroutineScope.launchSafely(itemId: String, block: suspend CoroutineScope.() -> Unit): Job =
     this.launch {
         try {
             block()
@@ -1292,6 +1365,6 @@ private fun CoroutineScope.launchSafely(block: suspend CoroutineScope.() -> Unit
             // Coop-cancelled — WorkshopDownloadJob.cancel already updated state
             throw e
         } catch (e: Throwable) {
-            WorkshopDownloadJob.markCrashed("Crashed: ${e.message ?: e.javaClass.name}")
+            WorkshopDownloadJob.markCrashed(itemId, "Crashed: ${e.message ?: e.javaClass.name}")
         }
     }

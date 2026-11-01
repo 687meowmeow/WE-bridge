@@ -246,25 +246,21 @@ class PairingService : Service() {
      * should stop (e.g. on Android 16 the dataSync FGS type can be asked to
      * stop shortly after starting if the system thinks it's no longer needed).
      *
+     * v0.7.20: Our `specialUse` foreground service type is NOT subject to the
+     * system timeout (only `dataSync` and `mediaProcessing` have the 6-hour
+     * timeout per the Android docs). So this callback should NEVER fire in
+     * practice. If it does (e.g. a future Android version extends timeouts to
+     * `specialUse`, or the OEM's battery optimizer triggers it), we gracefully
+     * stop the servers + foreground state and let the system restart us via
+     * START_STICKY (which will re-enter onStartCommand and re-promote to
+     * foreground once the app is in the foreground again).
+     *
      * If we don't call stopSelf() within the system's timeout window (a few
      * seconds), the system throws ForegroundServiceDidNotStopInTimeException
-     * and kills the app process — which is exactly the crash the user saw
-     * after the OOM killed the previous process.
-     *
-     * Our strategy: gracefully stop the servers and call stopForeground +
-     * stopSelf. The proxy will be restarted when the user returns to the
-     * Pairing screen (via PairingScreen's DisposableEffect →
-     * PairingService.start()) or on the next app launch (MainActivity.onCreate
-     * calls PairingService.start()).
-     *
-     * We do NOT auto-restart via AlarmManager — that's fragile on Android 14+
-     * (requires SCHEDULE_EXACT_ALARM permission, and the alarm might not fire
-     * if the app is killed under memory pressure). The proxy is meant to be
-     * "active while the app is in use" — auto-restart on next user action is
-     * the right UX for this use case.
+     * and kills the app process.
      */
     override fun onTimeout(startId: Int) {
-        WepWawetLogger.proxyWarn("PairingService.onTimeout — system requested stop",
+        WepWawetLogger.proxyWarn("PairingService.onTimeout — system requested stop (specialUse should not time out)",
             "start_id" to startId,
             "action" to "graceful_stop")
         // Stop the pairing servers cleanly so pairedDeviceName is cleared
@@ -272,8 +268,8 @@ class PairingService : Service() {
         // Remove the foreground notification
         stopForeground(STOP_FOREGROUND_REMOVE)
         // Stop the service — the proxy will resume on next PairingService.start()
-        // call (either from MainActivity.onCreate auto-start or from the user
-        // returning to the Pairing screen).
+        // call (either from MainActivity.onCreate auto-start, BootReceiver, or
+        // the user returning to the Pairing screen).
         stopSelf()
     }
 
@@ -530,6 +526,13 @@ class PairingService : Service() {
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
             description = "Pairing proxy service for Wallpaper Engine"
+            // v0.7.20: Show the notification on the lock screen so the user
+            // can always see/kill the proxy even when the phone is locked.
+            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            // v0.7.20: Don't allow the user to bypass via the channel
+            // settings — the notification IS the foreground service
+            // notification, hiding it defeats the purpose.
+            setShowBadge(false)
         }
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
@@ -560,11 +563,56 @@ class PairingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
+        // v0.7.20: Also wire a content-tap intent that opens MainActivity —
+        // tapping the notification body (not the Stop button) brings the
+        // user into the app so they can see pairing status / change settings.
+        val contentIntent = Intent(this, com.wepwawet.MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val contentPendingIntent = PendingIntent.getActivity(
+            this,
+            1,
+            contentIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        // v0.7.20: Notification hardening — the previous notification was
+        //   missing several flags that made it feel flaky on Android 13+:
+        //
+        //   setOngoing(true)           — already set; prevents swipe-dismiss
+        //                                on Android < 14. On Android 14+ the
+        //                                user CAN swipe an ongoing FGS notif,
+        //                                but the system re-posts it within a
+        //                                few seconds because the service is
+        //                                still running. There is no way to
+        //                                make an FGS notif truly non-swipeable
+        //                                on Android 14+ — the platform
+        //                                enforces this. We keep setOngoing so
+        //                                the system re-posts ASAP.
+        //   setShowWhen(false)         — hide the "just now" timestamp so
+        //                                the notification doesn't look stale.
+        //   setForegroundServiceBehavior(IMMEDIATE) — on Android 12+ this
+        //                                makes the notif appear the instant
+        //                                startForeground is called, rather
+        //                                than after a 10s grace period.
+        //   setPriority(PRIORITY_LOW)  — matches the channel importance.
+        //   setCategory(CATEGORY_SERVICE) — system UI groups it with other
+        //                                service notifications.
+        //   setVisibility(VISIBILITY_PUBLIC) — show on lock screen.
+        //   setOnlyAlertOnce(true)     — don't buzz/beep on every update.
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("WepWawet")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
+            .setShowWhen(false)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setForegroundServiceBehavior(
+                NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setContentIntent(contentPendingIntent)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 "Stop proxy",

@@ -20,9 +20,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -61,9 +61,11 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -275,7 +277,12 @@ fun WorkshopBrowserScreen(
     var tileMenuOpen by remember { mutableStateOf(false) }
 
     // === Grid state for infinite scroll ===
-    val gridState = rememberLazyGridState()
+    // v0.7.20: Use rememberSaveable with LazyGridState.Saver so the scroll
+    // position survives navigation (workshop → detail → back) AND process
+    // death. The previous rememberLazyGridState() was destroyed every time
+    // the user navigated to a wallpaper detail screen, so returning to the
+    // browser always snapped back to the top of the grid.
+    val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
 
     // === Load saved filter values on screen entry ===
     // Uses LaunchedEffect(Unit) so it runs a single time per composition.
@@ -533,7 +540,14 @@ fun WorkshopBrowserScreen(
     // initial composition (where Loaded(1) would equal the initial
     // state and we'd be at the top anyway) and avoids redundant
     // scrolls when the Loaded state hasn't actually changed.
-    var lastSeenPage by remember { mutableStateOf(0) }
+    //
+    // v0.7.20: lastSeenPage is now rememberSaveable so it survives
+    // navigation to a detail screen and back. Previously it was plain
+    // `remember { mutableStateOf(0) }` which reset to 0 on every return
+    // from detail — causing the LaunchedEffect to see page=N != 0 and
+    // scroll the grid to the top EVEN THOUGH the user was just viewing
+    // a wallpaper and expected to return to their scroll position.
+    var lastSeenPage by rememberSaveable { mutableIntStateOf(0) }
     LaunchedEffect(displayState, paginationEnabled) {
         if (!paginationEnabled) return@LaunchedEffect
         val loadedState = displayState as? WorkshopRepository.BrowseState.Loaded
