@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -76,7 +78,7 @@ fun SlimTopBar(
                         modifier = Modifier.size(48.dp),
                     ) {
                         Icon(
-                            imageVector = androidx.compose.material.icons.Icons.AutoMirrored.Filled.ArrowBack,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
                         )
                     }
