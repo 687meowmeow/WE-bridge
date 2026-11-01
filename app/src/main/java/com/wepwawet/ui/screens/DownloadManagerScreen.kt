@@ -8,13 +8,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,14 +26,12 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -54,6 +50,7 @@ import com.wepwawet.data.DownloadManager
 import com.wepwawet.data.DownloadProgress
 import com.wepwawet.data.DownloadStatus
 import com.wepwawet.log.WepWawetLogger
+import com.wepwawet.ui.components.SlimTopBar
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -78,7 +75,6 @@ import java.util.Locale
  *
  * @param onBack invoked when the back arrow is tapped
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DownloadManagerScreen(
     onBack: () -> Unit,
@@ -92,18 +88,11 @@ fun DownloadManagerScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                modifier = Modifier
-                    .statusBarsPadding()
-                    .height(56.dp),
-                title = { Text("Downloads") },
-                navigationIcon = {
-                    IconButton(onClick = {
-                        WepWawetLogger.workshop("download_manager back tapped")
-                        onBack()
-                    }) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
+            SlimTopBar(
+                title = "Downloads",
+                onBack = {
+                    WepWawetLogger.workshop("download_manager back tapped")
+                    onBack()
                 },
                 actions = {
                     if (completedList.isNotEmpty()) {
@@ -118,7 +107,6 @@ fun DownloadManagerScreen(
                         }
                     }
                 },
-                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         },
     ) { padding ->

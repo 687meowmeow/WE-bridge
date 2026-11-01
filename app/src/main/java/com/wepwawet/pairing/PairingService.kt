@@ -5,11 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import com.wepwawet.log.WepWawetLogger
 import java.io.File
@@ -58,6 +62,24 @@ class PairingService : Service() {
          * by the platform, not a background start).
          */
         const val ACTION_KILL = "com.wepwawet.pairing.ACTION_KILL"
+
+        /**
+         * v0.7.21: Broadcast action fired by the notification's delete intent
+         * when the user swipes the notification away. The dynamically-registered
+         * [notificationDeletedReceiver] catches this and re-posts the notification
+         * after a short delay — making the notification effectively non-dismissible
+         * (it comes back within ~500ms of being swiped).
+         *
+         * On Android 14+, `setOngoing(true)` no longer prevents the user from
+         * swiping an FGS notification. The system does NOT auto-repost it.
+         * This receiver is the workaround.
+         */
+        const val ACTION_NOTIFICATION_DELETED = "com.wepwawet.pairing.NOTIFICATION_DELETED"
+
+        /** v0.7.21: The last notification text — used by the delete receiver to
+         *  re-post the notification with the correct text. */
+        @Volatile
+        var lastNotificationText: String = "WepWawet proxy running"
 
         // ====== PIN persistence (v0.7.0) ======
         // The user can now set a custom PIN in Settings. It's persisted in
@@ -223,6 +245,31 @@ class PairingService : Service() {
     private var discoveryBroadcaster: WeDiscoveryBroadcaster? = null
 
     /**
+     * v0.7.21: Dynamically-registered receiver that catches the notification's
+     * delete intent (fired when the user swipes the notification away) and
+     * re-posts the notification after a 500ms delay.
+     *
+     * On Android 14+, `setOngoing(true)` does NOT prevent the user from
+     * swiping an FGS notification — the system allows dismissal and does NOT
+     * auto-repost. This receiver is the workaround: it catches the dismissal
+     * and immediately re-posts the notification, so the notification always
+     * stays visible while the proxy is running.
+     */
+    private val notificationDeletedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == ACTION_NOTIFICATION_DELETED) {
+                WepWawetLogger.proxy("PairingService: notification dismissed by user — re-posting in 500ms")
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (pairingServerLocal != null || discoveryBroadcaster != null) {
+                        updateNotification(lastNotificationText)
+                        WepWawetLogger.proxy("PairingService: notification re-posted after user dismissal")
+                    }
+                }, 500)
+            }
+        }
+    }
+
+    /**
      * v0.7.1 (round 6 — pairing persistence): tracks the PIN the currently-
      * running server was started with, so we can detect "PIN unchanged →
      * don't restart the live pairing session" in [onStartCommand].
@@ -237,6 +284,15 @@ class PairingService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        // v0.7.21: Register the notification-deleted receiver so we can
+        // re-post the notification when the user swipes it away (Android 14+
+        // allows dismissing ongoing FGS notifications — this is the workaround).
+        val filter = IntentFilter(ACTION_NOTIFICATION_DELETED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(notificationDeletedReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(notificationDeletedReceiver, filter)
+        }
         WepWawetLogger.proxy("PairingService.onCreate")
     }
 
@@ -487,6 +543,8 @@ class PairingService : Service() {
 
     override fun onDestroy() {
         WepWawetLogger.proxy("PairingService.onDestroy")
+        // v0.7.21: Unregister the notification-deleted receiver.
+        runCatching { unregisterReceiver(notificationDeletedReceiver) }
         stopServers()
         super.onDestroy()
     }
@@ -539,20 +597,10 @@ class PairingService : Service() {
     }
 
     private fun createNotification(text: String): Notification {
-        // v0.7.5: "Stop" action — lets the user kill the proxy from the
-        // notification shade without having to open the app. Tapping the
-        // action fires a PendingIntent that re-enters onStartCommand
-        // with [ACTION_KILL], which tears down the servers and stops
-        // the service.
-        //
-        // PendingIntent flags:
-        //   FLAG_UPDATE_CURRENT — if a prior PendingIntent exists, update
-        //     its extras rather than creating a new one (avoids stale
-        //     intent caching).
-        //   FLAG_IMMUTABLE — required on Android 12+ (API 31+) when the
-        //     PendingIntent doesn't need to be mutated by the receiver.
-        //     Our kill intent is fully self-contained (just an action
-        //     string), so immutable is the correct and most secure choice.
+        // v0.7.21: Store the text so the delete receiver can re-post with the
+        // correct text.
+        lastNotificationText = text
+
         val killIntent = Intent(this, PairingService::class.java).apply {
             action = ACTION_KILL
         }
@@ -563,9 +611,6 @@ class PairingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        // v0.7.20: Also wire a content-tap intent that opens MainActivity —
-        // tapping the notification body (not the Stop button) brings the
-        // user into the app so they can see pairing status / change settings.
         val contentIntent = Intent(this, com.wepwawet.MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -576,30 +621,21 @@ class PairingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
-        // v0.7.20: Notification hardening — the previous notification was
-        //   missing several flags that made it feel flaky on Android 13+:
-        //
-        //   setOngoing(true)           — already set; prevents swipe-dismiss
-        //                                on Android < 14. On Android 14+ the
-        //                                user CAN swipe an ongoing FGS notif,
-        //                                but the system re-posts it within a
-        //                                few seconds because the service is
-        //                                still running. There is no way to
-        //                                make an FGS notif truly non-swipeable
-        //                                on Android 14+ — the platform
-        //                                enforces this. We keep setOngoing so
-        //                                the system re-posts ASAP.
-        //   setShowWhen(false)         — hide the "just now" timestamp so
-        //                                the notification doesn't look stale.
-        //   setForegroundServiceBehavior(IMMEDIATE) — on Android 12+ this
-        //                                makes the notif appear the instant
-        //                                startForeground is called, rather
-        //                                than after a 10s grace period.
-        //   setPriority(PRIORITY_LOW)  — matches the channel importance.
-        //   setCategory(CATEGORY_SERVICE) — system UI groups it with other
-        //                                service notifications.
-        //   setVisibility(VISIBILITY_PUBLIC) — show on lock screen.
-        //   setOnlyAlertOnce(true)     — don't buzz/beep on every update.
+        // v0.7.21: Delete intent — fires a broadcast when the user swipes the
+        // notification away. The notificationDeletedReceiver catches it and
+        // re-posts the notification after 500ms. This makes the notification
+        // effectively non-dismissible: it always comes back while the service
+        // is running.
+        val deleteIntent = Intent(ACTION_NOTIFICATION_DELETED).apply {
+            setPackage(packageName)
+        }
+        val deletePendingIntent = PendingIntent.getBroadcast(
+            this,
+            2,
+            deleteIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("WepWawet")
             .setContentText(text)
@@ -613,6 +649,7 @@ class PairingService : Service() {
             .setForegroundServiceBehavior(
                 NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(contentPendingIntent)
+            .setDeleteIntent(deletePendingIntent)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
                 "Stop proxy",

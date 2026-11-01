@@ -418,7 +418,11 @@ object WorkshopDownloadJob {
             WepWawetLogger.workshop("WorkshopDownloadJob: acquired wake lock for packing",
                 "timeout_ms" to (10 * 60 * 1000L))
             val mpkgSize = try {
-                runCatching {
+                // v0.7.21 BUG FIX: was `runCatching { ... }.getOrElse { e -> ... }`
+                // which swallowed CancellationException (runCatching catches Throwable).
+                // Now uses explicit try/catch that re-throws CancellationException
+                // so structured concurrency is preserved.
+                try {
                     if (isVideo) {
                         WepWawetLogger.workshop("WorkshopDownloadJob: calling packVideoWallpaper",
                             "video_file" to downloadedPkg.name,
@@ -455,7 +459,9 @@ object WorkshopDownloadJob {
                             installDir = installDir,
                         )
                     }
-                }.getOrElse { e ->
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
                     val err = "Failed to pack → .mpkg: ${e.message}"
                     WepWawetLogger.workshopWarn("WorkshopDownloadJob: pack failed",
                         "exception" to e.javaClass.name, "message" to (e.message ?: ""),
@@ -865,7 +871,9 @@ object WorkshopDownloadJob {
                 WepWawetLogger.workshop("WorkshopDownloadJob.send: acquired wake lock for packing",
                     "timeout_ms" to (10 * 60 * 1000L))
                 val mpkgSize = try {
-                    runCatching {
+                    // v0.7.21 BUG FIX: was runCatching — now explicit try/catch
+                    // that re-throws CancellationException.
+                    try {
                         if (isVideo) {
                             WepWawetLogger.workshop("WorkshopDownloadJob.send: calling packVideoWallpaper",
                                 "video_file" to downloadedPkg.name,
@@ -904,7 +912,9 @@ object WorkshopDownloadJob {
                                 installDir = installDir,
                             )
                         }
-                    }.getOrElse { e ->
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
                         val err = "Failed to pack → .mpkg: ${e.message}"
                         WepWawetLogger.workshopWarn("WorkshopDownloadJob.send: pack failed",
                             "exception" to e.javaClass.name, "message" to (e.message ?: ""),
@@ -1143,6 +1153,10 @@ object WorkshopDownloadJob {
                     savedFileSize = cacheMpkg.length(),
                 ) }
                 onDownloadCompleted(pendingItem, cacheMpkg.length(), deviceName)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // v0.7.21 BUG FIX: re-throw CancellationException — was swallowed
+                // by catch (e: Exception) which broke structured concurrency.
+                throw e
             } catch (e: Exception) {
                 WepWawetLogger.workshopWarn("WorkshopDownloadJob.continueVideoSend: failed",
                     "exception" to e.javaClass.name, "message" to (e.message ?: ""))

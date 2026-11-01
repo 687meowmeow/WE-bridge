@@ -6,11 +6,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
@@ -20,7 +18,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -30,7 +27,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -50,6 +46,7 @@ import com.wepwawet.log.WepWawetLogger
 import com.wepwawet.pairing.SteamCredentialsStore
 import com.wepwawet.pairing.WorkshopBrowseSession
 import com.wepwawet.pairing.WorkshopDownloader
+import com.wepwawet.ui.components.SlimTopBar
 import kotlinx.coroutines.launch
 
 /**
@@ -118,7 +115,6 @@ private const val KEY_PKG_CACHE_ENABLED = "pkg_cache_enabled"
  * @param onOpenLogs Called when the user taps the Logs button (top-right,
  *                   visible only while verbose logging is enabled).
  */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
@@ -205,23 +201,15 @@ fun SettingsScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                modifier = Modifier
-                    .statusBarsPadding()
-                    .height(56.dp),
-                title = { Text("Settings") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
+            SlimTopBar(
+                title = "Settings",
+                onBack = onBack,
                 // Logs button (top-right) — always shown (v0.7.1).
                 actions = {
                     IconButton(onClick = onOpenLogs) {
                         Icon(Icons.Filled.BugReport, contentDescription = "Logs")
                     }
                 },
-                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         }
     ) { innerPadding ->
@@ -875,12 +863,42 @@ private fun CacheCard(context: Context) {
                 onClick = {
                     WepWawetLogger.appInfo("settings_clear_cache_clicked")
                     try {
+                        // v0.7.21 BUG FIX: Skip files that are actively being
+                        // written by in-flight downloads. Deleting these causes
+                        // silent download failures (FileNotFoundException when
+                        // the download/pack tries to read the deleted file).
+                        // Skip patterns: *_send.pkg, *_debug.pkg, *_send.mpkg,
+                        // *_debug.mpkg, *_trimmed.mp4, and the entire
+                        // workshop_downloads/ directory.
                         context.cacheDir.walkTopDown().forEach { f ->
-                            if (f.isFile) f.delete()
+                            if (!f.isFile) return@forEach
+                            val name = f.name
+                            val path = f.absolutePath
+                            if (name.endsWith("_send.pkg") ||
+                                name.endsWith("_debug.pkg") ||
+                                name.endsWith("_send.mpkg") ||
+                                name.endsWith("_debug.mpkg") ||
+                                name.endsWith("_trimmed.mp4") ||
+                                path.contains("workshop_downloads/")
+                            ) {
+                                return@forEach
+                            }
+                            f.delete()
                         }
-                        // Also clear the external cache dir if it exists
                         context.externalCacheDir?.walkTopDown()?.forEach { f ->
-                            if (f.isFile) f.delete()
+                            if (!f.isFile) return@forEach
+                            val name = f.name
+                            val path = f.absolutePath
+                            if (name.endsWith("_send.pkg") ||
+                                name.endsWith("_debug.pkg") ||
+                                name.endsWith("_send.mpkg") ||
+                                name.endsWith("_debug.mpkg") ||
+                                name.endsWith("_trimmed.mp4") ||
+                                path.contains("workshop_downloads/")
+                            ) {
+                                return@forEach
+                            }
+                            f.delete()
                         }
                         cleared = !cleared
                         WepWawetLogger.appInfo("settings_clear_cache_done")

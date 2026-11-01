@@ -1,6 +1,7 @@
 package com.wepwawet.ui
 
 import android.content.Context
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
@@ -87,6 +88,17 @@ fun WepWawetNavHost() {
     val steamApi = remember { SteamApiService(appContext = context.applicationContext) }
     val repo = remember { WorkshopRepository(steamApi) }
 
+    // v0.7.21: Hoist the LazyGridState for the workshop + creator screens to
+    // the NavHost level so scroll position survives navigation to detail and
+    // back. The old rememberLazyGridState() (which uses rememberSaveable
+    // internally) didn't reliably restore scroll position within NavHost
+    // composables — the state was lost when the composable left composition
+    // during navigation. By hoisting to the NavHost level (which never leaves
+    // composition), the gridState object persists across the entire app
+    // session.
+    val workshopGridState = remember { LazyGridState() }
+    val creatorGridState = remember { LazyGridState() }
+
     // Reload the Steam Web API key every time the user returns to the NavHost
     // (e.g. after saving a new key in Settings). Uses a lifecycle observer so
     // the key is always current.
@@ -121,6 +133,7 @@ fun WepWawetNavHost() {
                 onOpenPairing = { nav.navigate("pairing") },
                 onCreatorClick = { steamId -> nav.navigate("creator/$steamId") },
                 repo = repo,
+                gridState = workshopGridState,
             )
         }
 
@@ -141,6 +154,7 @@ fun WepWawetNavHost() {
                 onBack = { nav.popBackStack() },
                 creatorSteamId = steamId,
                 repo = repo,
+                gridState = creatorGridState,
             )
         }
 
@@ -233,8 +247,18 @@ fun WepWawetNavHost() {
                 "item_id" to trimItemId,
                 "video_path" to (trimVideoPath ?: "null"),
                 "item_title" to trimItemTitle)
+            // v0.7.21 BUG FIX: If pendingVideoFor returns null (e.g. the
+            // pending state was cleared by a concurrent cancelVideoSend, or
+            // the user deep-linked to this route without a pending video),
+            // pop back immediately instead of showing a broken trim screen
+            // with File("") that ExoPlayer can't load.
+            if (trimVideoPath == null) {
+                WepWawetLogger.lifecycle("NavHost videoTrim: no pending video — popping back")
+                nav.popBackStack()
+                return@composable
+            }
             VideoTrimScreen(
-                videoFile = java.io.File(trimVideoPath ?: ""),
+                videoFile = java.io.File(trimVideoPath),
                 itemTitle = trimItemTitle,
                 itemId = trimItemId,
                 onBack = { nav.popBackStack() },

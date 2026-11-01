@@ -57,7 +57,8 @@ object WepWawetLogger {
         CRASH("WEP-CRASH"),
     }
 
-    private const val RING_BUFFER_CAPACITY = 2000
+    // v0.7.21: Increased from 2000 to 5000 per user request.
+    private const val RING_BUFFER_CAPACITY = 5000
     private const val PREF_NAME = "wepwawet_logger"
     private const val PREF_MIN_LEVEL = "min_level"
 

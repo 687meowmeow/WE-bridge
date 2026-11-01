@@ -4,27 +4,28 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -32,12 +33,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -53,8 +51,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
@@ -67,6 +67,7 @@ import com.wepwawet.data.model.WorkshopItemTyped
 import com.wepwawet.log.WepWawetLogger
 import com.wepwawet.pairing.PairingService
 import com.wepwawet.pairing.VideoTrimmer
+import com.wepwawet.ui.components.SlimTopBar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,44 +75,21 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * Video trim screen — a standard mobile video trimmer UI:
+ * Video trim screen — a mobile video trimmer UI with a scrollable filmstrip,
+ * two draggable clip bars (start/end), and a center playhead marker.
  *
- *   ┌──────────────────────────────────────────────────────┐
- *   │  Video preview (matches video's actual aspect ratio) │
- *   └──────────────────────────────────────────────────────┘
- *
- *   start                                              end
- *   00:03                                            00:14
- *
- *   ┌─▼─┬────────────────────────────────────────────┬─▼─┐
- *   │░░░│ [thumb][thumb][thumb][thumb][thumb][thumb] │░░░│
- *   │░░░│ [thumb][thumb][thumb][thumb][thumb][thumb] │░░░│
- *   └───┴────────────────────────────────────────────┴───┘
- *
- *   ↑ dimmed    ↑ thumbnails form the bar background     ↑ dimmed
- *               (selected region — frames visible)
- *
- *   [ Trim & Send ] [ Send Full Video (No Trim) ]
- *
- * The video frames ARE the bar. Two dim overlays cover the parts
- * outside the selected range. The RangeSlider sits on top with
- * transparent track colors — only the thumb handles are visible,
- * sitting on top of the strip like every other mobile video trimmer
- * (WhatsApp / iMovie / CapCut / etc.).
- *
- * v0.7.20: The filmstrip is now HORIZONTALLY SCROLLABLE with 40
- * frames (up from a fixed 16 that were squashed into the screen
- * width). Each frame is a fixed width derived from the video's
- * aspect ratio, so the strip is much wider than the screen — the
- * user scrolls across it like in a real video editor. The whole
- * screen is also vertically scrollable so that tall (portrait)
- * videos don't push the trim controls off the bottom of the
- * screen. The video preview's aspect ratio is preserved exactly.
- *
- * "Trim & Send" trims the video (lossless stream copy via
- * [VideoTrimmer.trim]) and queues it for transfer.
- * "Send Full Video" skips trimming and sends the full video
- * (same pack + queue code as the pre-trim send-to-phone).
+ * v0.7.21 redesign:
+ *   - Filmstrip is horizontally scrollable with 40 frames at the video's
+ *     true aspect ratio.
+ *   - Two custom draggable vertical clip bars (start + end) replace the
+ *     old RangeSlider. Each clip bar is independently draggable.
+ *   - A center playhead marker (vertical white line) shows the current
+ *     playback position.
+ *   - The video player only allows play/pause — no seeking, no next/prev,
+ *     no fast-forward/rewind. PlayerView.useController = false + a custom
+ *     play/pause overlay button.
+ *   - The whole screen is vertically scrollable so tall (portrait) videos
+ *     don't push the trim controls off-screen.
  *
  * @param videoFile The downloaded video file (already exists on disk).
  * @param itemTitle Wallpaper title.
@@ -130,6 +108,7 @@ fun VideoTrimScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
 
     val videoUri = remember { Uri.fromFile(videoFile).toString() }
 
@@ -142,7 +121,12 @@ fun VideoTrimScreen(
             repeatMode = Player.REPEAT_MODE_ONE
         }
     }
-    DisposableEffect(Unit) { onDispose { player.release() } }
+    DisposableEffect(Unit) {
+        onDispose {
+            player.pause()
+            player.release()
+        }
+    }
 
     // Video metadata + trimmer state.
     var durationMs by remember { mutableLongStateOf(0L) }
@@ -153,21 +137,11 @@ fun VideoTrimScreen(
     var currentPosition by remember { mutableLongStateOf(0L) }
     var isTrimming by remember { mutableStateOf(false) }
     var trimStatus by remember { mutableStateOf("") }
+    var isPlaying by remember { mutableStateOf(true) }
 
-    // v0.7.3: 16 frame thumbnails (was 8). More frames = clearer
-    // visual sense of the video's content as the user drags. The
-    // thumbnails form the BACKGROUND of the trim bar (not a separate
-    // row above it) — the standard pattern used by every mobile video
-    // trimmer (WhatsApp, iMovie, CapCut, VN, etc.).
     val thumbnails = remember { mutableStateListOf<android.graphics.Bitmap>() }
 
-    // Get video metadata (duration, width, height) + generate thumbnails.
-    // v0.7.4: the retriever is released in a FINALLY block (it used to be the
-    // last statement inside the try — any throw from setDataSource/
-    // extractMetadata/getFrameAtTime leaked the native MediaMetadataRetriever),
-    // and CancellationException is re-thrown instead of being logged as a
-    // warning (swallowing it broke structured concurrency when the user
-    // navigated away mid-load).
+    // Generate frame thumbnails.
     LaunchedEffect(videoFile) {
         withContext(Dispatchers.IO) {
             val retriever = MediaMetadataRetriever()
@@ -183,24 +157,14 @@ fun VideoTrimScreen(
                 WepWawetLogger.workshop("VideoTrimScreen: metadata loaded",
                     "duration_ms" to dur, "width" to w, "height" to h)
 
-                // v0.7.20: Generate 40 frame thumbnails (up from 16) evenly
-                // spaced across the video duration. The filmstrip is now
-                // horizontally scrollable, so the frames are NOT squashed
-                // into the screen width — each is rendered at its natural
-                // aspect-ratio-derived width and the user scrolls across.
-                // Using OPTION_CLOSEST_SYNC (sync frames only) is fast —
-                // each call is ~10-30ms even for big videos, so 40 calls
-                // add up to well under 1.5 seconds.
+                // v0.7.21: Clear any stale thumbnails before regenerating.
+                thumbnails.clear()
+
                 val thumbCount = 40
                 for (i in 0 until thumbCount) {
                     val t = if (thumbCount > 1) dur * i / (thumbCount - 1) else 0
                     val bmp = retriever.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                     if (bmp != null) {
-                        // Scale down to height=160px (crisp at 72dp on xhdpi+)
-                        // and width proportional to the video's aspect ratio.
-                        // ContentScale.FillBounds in the strip Row will then
-                        // stretch/squash each frame to its uniform-weight slot,
-                        // giving the filmstrip look.
                         val targetH = 160
                         val targetW = (targetH * w / h).toInt().coerceAtLeast(1)
                         val scaled = android.graphics.Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
@@ -221,11 +185,12 @@ fun VideoTrimScreen(
         }
     }
 
-    // Poll current position for the progress bar.
+    // Poll current position for the playhead marker.
     LaunchedEffect(player) {
         while (true) {
             currentPosition = player.currentPosition
-            delay(200)
+            isPlaying = player.isPlaying
+            delay(100)
         }
     }
 
@@ -235,44 +200,20 @@ fun VideoTrimScreen(
         16f / 9f
     }
 
-    // v0.7.20: Filmstrip dimensions — each frame is a fixed height (72dp)
-    // with width derived from the video's aspect ratio, so frames display
-    // at the correct proportions. The total strip width = frameWidth ×
-    // frameCount, which is much wider than the screen — the user scrolls
-    // horizontally across the strip like in a real video editor.
+    // v0.7.21: Filmstrip dimensions.
     val filmstripHeight = 72.dp
     val frameWidthDp = filmstripHeight * aspectRatio
-    // thumbCount must match the count used in the thumbnail-generation
-    // LaunchedEffect above.
     val frameCount = 40
     val totalStripWidthDp = frameWidthDp * frameCount
     val filmstripScrollState = rememberScrollState()
+    // Convert total strip width to pixels for drag delta → time conversion.
+    val totalStripWidthPx = with(density) { totalStripWidthDp.toPx() }
 
     Scaffold(
         topBar = {
-            // v0.7.20: Slim top bar (56dp + status bar padding) to match
-            // the WorkshopBrowserScreen — the default 64dp + inset wastes
-            // vertical space on this screen where every pixel matters for
-            // the video preview + filmstrip.
-            TopAppBar(
-                modifier = Modifier
-                    .statusBarsPadding()
-                    .height(56.dp),
-                title = { Text("Trim Video", maxLines = 1) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                windowInsets = WindowInsets(0, 0, 0, 0),
-            )
+            SlimTopBar(title = "Trim Video", onBack = onBack)
         },
     ) { padding ->
-        // v0.7.20: Wrap the whole content in verticalScroll so that when
-        // the video preview is tall (portrait videos), the user can scroll
-        // down to reach the filmstrip + buttons. The preview's aspectRatio
-        // is preserved exactly — we just let the content be as tall as it
-        // needs to be and scroll if it overflows.
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -282,6 +223,10 @@ fun VideoTrimScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             // === Video preview (matches video's actual aspect ratio) ===
+            // v0.7.21: PlayerView.useController = false — the user can only
+            // pause/play via the overlay button. No seeking, no next/prev,
+            // no fast-forward/rewind. This prevents the user from messing
+            // with the playback position while trimming.
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -289,17 +234,39 @@ fun VideoTrimScreen(
                 shape = RoundedCornerShape(12.dp),
                 color = Color.Black,
             ) {
-                AndroidView(
-                    factory = { ctx ->
-                        PlayerView(ctx).apply {
-                            this.player = player
-                            useController = true
-                            setShowNextButton(false)
-                            setShowPreviousButton(false)
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize(),
-                )
+                Box(modifier = Modifier.fillMaxSize()) {
+                    AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                this.player = player
+                                useController = false
+                                setShowNextButton(false)
+                                setShowPreviousButton(false)
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    // Play/pause overlay button — centered on the video.
+                    IconButton(
+                        onClick = {
+                            if (player.isPlaying) {
+                                player.pause()
+                            } else {
+                                player.play()
+                            }
+                        },
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(56.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (isPlaying) "Pause" else "Play",
+                            tint = Color.White.copy(alpha = 0.8f),
+                            modifier = Modifier.size(40.dp),
+                        )
+                    }
+                }
             }
 
             // === Time labels ===
@@ -314,42 +281,27 @@ fun VideoTrimScreen(
                     color = MaterialTheme.colorScheme.primary)
             }
 
-            // === v0.7.20: Scrollable filmstrip trimmer ===
-            // Layout (bottom to top in a horizontally-scrollable Box):
-            //   1. Row of 40 frame thumbnails, each at a FIXED width derived
-            //      from the video's aspect ratio. The total row width is
-            //      much wider than the screen, so the user scrolls
-            //      horizontally across the strip (like in a real video
-            //      editor — iMovie, CapCut, etc.).
-            //   2. Dim overlays (left/middle/right) on top of the frames,
-            //      spanning the full scrollable width so the dimmed region
-            //      maps correctly to the selected time range.
-            //   3. RangeSlider on top, also spanning the full scrollable
-            //      width, so the thumb handles sit at the correct time
-            //      positions. The slider + dims + frames all scroll
-            //      together as one unit.
+            // === v0.7.21: Scrollable filmstrip with custom draggable clip bars ===
             if (durationMs > 0) {
-                val startRange = startMs.toFloat() / durationMs
-                val endRange = endMs.toFloat() / durationMs
-                val leftDimWeight = startRange.coerceIn(0f, 1f)
-                val middleWeight = (endRange - startRange).coerceIn(0f, 1f)
-                val rightDimWeight = (1f - endRange).coerceIn(0f, 1f)
+                val startFraction = startMs.toFloat() / durationMs
+                val endFraction = endMs.toFloat() / durationMs
+                val playheadFraction = if (durationMs > 0) {
+                    currentPosition.toFloat() / durationMs
+                } else 0f
 
-                // The outer Box clips the filmstrip to a rounded rectangle.
-                // The inner Box is horizontally scrollable and contains the
-                // frames + dims + slider at totalStripWidthDp width.
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(filmstripHeight)
                         .clip(RoundedCornerShape(6.dp)),
                 ) {
+                    // Inner scrollable Box — frames + dim overlays + clip bars + playhead
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .horizontalScroll(filmstripScrollState),
                     ) {
-                        // 1) Thumbnail strip background (frames ARE the bar)
+                        // 1) Thumbnail strip background
                         if (thumbnails.isNotEmpty()) {
                             Row(
                                 modifier = Modifier
@@ -369,7 +321,6 @@ fun VideoTrimScreen(
                                 }
                             }
                         } else {
-                            // Fallback while thumbnails load
                             Box(
                                 modifier = Modifier
                                     .width(totalStripWidthDp)
@@ -382,20 +333,18 @@ fun VideoTrimScreen(
                         }
 
                         // 2) Dimmed overlays outside the selected region.
-                        // Three weighted Boxes spanning the full strip width
-                        // — when startRange=0 the left dim is invisible
-                        // (weight 0 = 0 width); same for the right dim when
-                        // endRange=1. The middle Box is transparent so the
-                        // frames show through.
                         Row(
                             modifier = Modifier
                                 .width(totalStripWidthDp)
                                 .fillMaxHeight(),
                         ) {
-                            if (leftDimWeight > 0f) {
+                            val leftWeight = startFraction.coerceIn(0f, 1f)
+                            val middleWeight = (endFraction - startFraction).coerceIn(0f, 1f)
+                            val rightWeight = (1f - endFraction).coerceIn(0f, 1f)
+                            if (leftWeight > 0f) {
                                 Box(
                                     modifier = Modifier
-                                        .weight(leftDimWeight)
+                                        .weight(leftWeight)
                                         .fillMaxHeight()
                                         .background(Color.Black.copy(alpha = 0.55f)),
                                 )
@@ -403,51 +352,98 @@ fun VideoTrimScreen(
                             if (middleWeight > 0f) {
                                 Box(modifier = Modifier.weight(middleWeight))
                             }
-                            if (rightDimWeight > 0f) {
+                            if (rightWeight > 0f) {
                                 Box(
                                     modifier = Modifier
-                                        .weight(rightDimWeight)
+                                        .weight(rightWeight)
                                         .fillMaxHeight()
                                         .background(Color.Black.copy(alpha = 0.55f)),
                                 )
                             }
                         }
 
-                        // 3) RangeSlider on top — transparent track colors so
-                        //    only the two thumb handles are visible, sitting
-                        //    on top of the strip. The slider spans the full
-                        //    scrollable width so the thumbs map to the correct
-                        //    time positions. As the user scrolls the filmstrip,
-                        //    the slider scrolls with it (thumbs move with the
-                        //    frames). The user drags a thumb by touching it
-                        //    directly; touching elsewhere on the strip scrolls.
-                        RangeSlider(
-                            value = startRange..endRange,
-                            onValueChange = { range ->
-                                // Enforce a 500ms minimum selection so the
-                                // start/end can't collapse onto each other.
-                                val newStart = (range.start * durationMs).toLong()
-                                    .coerceAtMost((endMs - 500).coerceAtLeast(0))
-                                startMs = newStart
-                                val newEnd = (range.endInclusive * durationMs).toLong()
-                                    .coerceAtLeast(newStart + 500).coerceAtMost(durationMs)
-                                endMs = newEnd
-                            },
-                            onValueChangeFinished = {
-                                // Seek the preview to the start handle when the
-                                // user lifts their finger — gives a "preview
-                                // from the trim point" effect.
-                                player.seekTo(startMs)
-                            },
+                        // 3) Center playhead marker — a thin vertical white line
+                        //    showing the current playback position. Moves with
+                        //    scroll (it's inside the scrollable area).
+                        if (playheadFraction > 0f) {
+                            Box(
+                                modifier = Modifier
+                                    .width(totalStripWidthDp)
+                                    .fillMaxHeight(),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .offset(x = (totalStripWidthDp * playheadFraction))
+                                        .width(2.dp)
+                                        .fillMaxHeight()
+                                        .background(Color.White.copy(alpha = 0.9f)),
+                                )
+                            }
+                        }
+
+                        // 4) Start clip bar — draggable vertical bar at startMs.
+                        //    The drag gesture converts horizontal pixel delta to
+                        //    time delta: deltaTime = (deltaPx / totalStripWidthPx)
+                        //    * durationMs.
+                        //    v0.7.21: 36dp touch target with a 4dp visible bar.
+                        Box(
                             modifier = Modifier
                                 .width(totalStripWidthDp)
-                                .align(Alignment.Center),
-                            colors = SliderDefaults.colors(
-                                activeTrackColor = Color.Transparent,
-                                inactiveTrackColor = Color.Transparent,
-                                thumbColor = Color.White,
-                            ),
-                        )
+                                .fillMaxHeight(),
+                        ) {
+                            // Start clip bar
+                            Box(
+                                modifier = Modifier
+                                    .offset(x = (totalStripWidthDp * startFraction) - 18.dp)
+                                    .width(36.dp)
+                                    .fillMaxHeight()
+                                    .pointerInput(durationMs) {
+                                        detectHorizontalDragGestures(
+                                            onDragStart = { },
+                                            onDragEnd = { player.seekTo(startMs) },
+                                        ) { _, dragAmount ->
+                                            if (durationMs <= 0) return@detectHorizontalDragGestures
+                                            val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                            startMs = (startMs + deltaTime)
+                                                .coerceIn(0L, (endMs - 500).coerceAtLeast(0))
+                                        }
+                                    },
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.Center)
+                                        .width(4.dp)
+                                        .fillMaxHeight()
+                                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                                )
+                            }
+                            // End clip bar
+                            Box(
+                                modifier = Modifier
+                                    .offset(x = (totalStripWidthDp * endFraction) - 18.dp)
+                                    .width(36.dp)
+                                    .fillMaxHeight()
+                                    .pointerInput(durationMs) {
+                                        detectHorizontalDragGestures(
+                                            onDragStart = { },
+                                            onDragEnd = { player.seekTo(endMs) },
+                                        ) { _, dragAmount ->
+                                            if (durationMs <= 0) return@detectHorizontalDragGestures
+                                            val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                            endMs = (endMs + deltaTime)
+                                                .coerceIn((startMs + 500).coerceAtLeast(0), durationMs)
+                                        }
+                                    },
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.Center)
+                                        .width(4.dp)
+                                        .fillMaxHeight()
+                                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                                )
+                            }
+                        }
                     }
                 }
             } else {
@@ -469,14 +465,9 @@ fun VideoTrimScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
-            // v0.7.20: Fixed spacer (was Modifier.weight(1f) which doesn't
-            // work inside a verticalScroll — the column has unbounded height
-            // so weight has no meaning).
             Spacer(Modifier.height(16.dp))
 
             // === Trim & Send + Send Full Video side by side ===
-            // Both buttons in a single Row (side by side, not stacked
-            // vertically) per the v0.7.2 dialog redesign.
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -512,20 +503,14 @@ fun VideoTrimScreen(
                                     PairingService.launchWallpaperEngineApp(context)
                                     runCatching { trimmedFile.delete() }
                                     runCatching { videoFile.delete() }
-                                    // v0.7.4: clean up the install dir (contains
-                                    // project.json/preview.jpg the pack consumed).
                                     runCatching { installDir.deleteRecursively() }
-                                    // v0.7.4: clear the pending-video state so the
-                                    // "Video Downloaded" dialog does NOT reappear
-                                    // after we pop back — and so a second "Trim
-                                    // Video" tap can't navigate here with a path to
-                                    // a file we just deleted (stuck spinner).
                                     com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen(itemId)
                                     WepWawetLogger.workshop("VideoTrimScreen: trim + send complete",
                                         "item_id" to itemId, "mpkg_size" to mpkgFile.length())
                                     isTrimming = false
                                     onSendComplete()
                                 } catch (e: kotlinx.coroutines.CancellationException) {
+                                    isTrimming = false
                                     throw e
                                 } catch (e: Exception) {
                                     isTrimming = false
@@ -564,13 +549,12 @@ fun VideoTrimScreen(
                                     PairingService.queueWallpaper(mpkgFile, itemTitle)
                                     PairingService.launchWallpaperEngineApp(context)
                                     runCatching { videoFile.delete() }
-                                    // v0.7.4: same install-dir cleanup + pending-state
-                                    // clear as the trim path.
                                     runCatching { installDir.deleteRecursively() }
                                     com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen(itemId)
                                     isTrimming = false
                                     onSendComplete()
                                 } catch (e: kotlinx.coroutines.CancellationException) {
+                                    isTrimming = false
                                     throw e
                                 } catch (e: Exception) {
                                     isTrimming = false

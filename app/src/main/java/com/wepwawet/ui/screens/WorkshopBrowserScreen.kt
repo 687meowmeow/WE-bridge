@@ -188,6 +188,10 @@ fun WorkshopBrowserScreen(
     onBack: (() -> Unit)? = null,
     creatorSteamId: String? = null,
     creatorDisplayName: String? = null,
+    // v0.7.21: gridState is now hoisted to the NavHost level so it survives
+    // navigation to detail and back. The old rememberSaveable approach didn't
+    // reliably restore scroll position within NavHost composables.
+    gridState: LazyGridState = LazyGridState(),
 ) {
     // === Repository state ===
     val items by repo.browseItems.collectAsState()
@@ -277,12 +281,11 @@ fun WorkshopBrowserScreen(
     var tileMenuOpen by remember { mutableStateOf(false) }
 
     // === Grid state for infinite scroll ===
-    // v0.7.20: Use rememberSaveable with LazyGridState.Saver so the scroll
-    // position survives navigation (workshop → detail → back) AND process
-    // death. The previous rememberLazyGridState() was destroyed every time
-    // the user navigated to a wallpaper detail screen, so returning to the
-    // browser always snapped back to the top of the grid.
-    val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
+    // v0.7.21: gridState is now passed in from the NavHost (hoisted) so it
+    // survives navigation to detail and back. The old rememberSaveable/
+    // rememberLazyGridState approaches didn't reliably restore scroll
+    // position within NavHost composables — the state was lost when the
+    // composable left composition during navigation.
 
     // === Load saved filter values on screen entry ===
     // Uses LaunchedEffect(Unit) so it runs a single time per composition.

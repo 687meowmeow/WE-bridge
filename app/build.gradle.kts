@@ -404,8 +404,41 @@ android {
         //     cancels a specific download; cancel() cancels all.
         //   - SettingsScreen: removed ".mpkg" from the Clear Cache description
         //     (.mpkg files are packed on-demand and queued, not cached).
-        versionCode = 112
-        versionName = "0.7.20-alpha"
+        // v0.7.21-alpha: notification re-post on dismiss + scroll position fix +
+        //   VideoTrim redesign + SlimTopBar + log limit + critical bug fixes.
+        //   - Notification: setDeleteIntent + BroadcastReceiver re-posts the
+        //     notification when the user swipes it away (Android 14+ allows
+        //     dismissing ongoing FGS notifications — this is the workaround).
+        //   - WorkshopBrowser: gridState hoisted to NavHost level (was
+        //     rememberSaveable which didn't reliably restore scroll position
+        //     within NavHost composables). Scroll position now survives
+        //     navigation to detail and back.
+        //   - VideoTrim: replaced RangeSlider with custom draggable clip bars
+        //     (2 vertical bars for start/end, 36dp touch target + 4dp visible).
+        //     Added a center playhead marker (white vertical line) showing
+        //     current playback position. Disabled PlayerView controls except
+        //     play/pause (useController = false + overlay play/pause button).
+        //   - SlimTopBar: new reusable composable (Surface + Row with
+        //     CenterVertically) replaces Material 3 TopAppBar on all 7 non-main
+        //     screens. The TopAppBar's internal layout didn't vertically center
+        //     the title at 56dp height — SlimTopBar fixes this.
+        //   - Log limit: RING_BUFFER_CAPACITY 2000 → 5000, LogsScreen limit
+        //     2000 → 5000.
+        //   - BUG 1 (Critical): maybeShrinkRgba never read the rgba array —
+        //     texture shrink produced garbled textures. Fixed.
+        //   - BUG 4/5 (High): runCatching in WorkshopDownloadJob swallowed
+        //     CancellationException. Replaced with try/catch that re-throws.
+        //   - BUG 23 (High): Clear Cache deleted in-flight download temp files.
+        //     Now skips *_send.pkg, *_debug.pkg, *_send.mpkg, *_debug.mpkg,
+        //     *_trimmed.mp4, and workshop_downloads/.
+        //   - BUG 25 (Medium): FavoritesScreen catch(Exception) swallowed
+        //     CancellationException. Fixed.
+        //   - BUG 33 (High): CrashHandler shared StringBuilder between crash
+        //     thread and helper thread. Helper now writes to its own SB.
+        //   - BUG 47 (Medium): videoTrim route passed File("") when
+        //     pendingVideoFor returned null. Now pops back immediately.
+        versionCode = 113
+        versionName = "0.7.21-alpha"
         // Native ABI filter — only build for arm64-v8a (WE app targets Snapdragon 8 Gen 2+)
         ndk {
             abiFilters += "arm64-v8a"

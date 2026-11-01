@@ -8,13 +8,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -25,13 +22,11 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -51,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import com.wepwawet.log.LogEntry
 import com.wepwawet.log.PublicDownloadsWriter
 import com.wepwawet.log.WepWawetLogger
+import com.wepwawet.ui.components.SlimTopBar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -59,7 +55,6 @@ import java.time.format.DateTimeFormatter
 import java.time.ZoneId
 import java.time.ZonedDateTime
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LogsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -77,7 +72,8 @@ fun LogsScreen(onBack: () -> Unit) {
         // full-LazyColumn recomposition twice per second.
         WepWawetLogger.events.collect { entry ->
             events.add(entry)
-            while (events.size > 2000) events.removeAt(0)
+            // v0.7.21: Increased from 2000 to 5000 to match RING_BUFFER_CAPACITY.
+            while (events.size > 5000) events.removeAt(0)
         }
     }
 
@@ -176,16 +172,9 @@ fun LogsScreen(onBack: () -> Unit) {
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                modifier = Modifier
-                    .statusBarsPadding()
-                    .height(56.dp),
-                title = { Text("Logs (${events.size})") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
+            SlimTopBar(
+                title = "Logs (${events.size})",
+                onBack = onBack,
                 actions = {
                     // Download logs to Downloads/WepWawet/
                     IconButton(
@@ -211,7 +200,6 @@ fun LogsScreen(onBack: () -> Unit) {
                         Icon(Icons.Filled.Delete, contentDescription = "Clear logs")
                     }
                 },
-                windowInsets = WindowInsets(0, 0, 0, 0),
             )
         }
     ) { padding ->

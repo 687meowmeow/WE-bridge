@@ -124,11 +124,19 @@ class CrashHandler private constructor(
         // forever and the crash report would never be written. We compute the
         // snapshot on a helper thread and wait at most 2 seconds for it — if
         // the logger is deadlocked we still write the rest of the report.
+        //
+        // v0.7.21 BUG FIX: the helper thread was writing to the SAME StringBuilder
+        // (`sb`) as the main crash-handler thread. If the 2-second join timed out,
+        // the helper thread was STILL running and mutating `sb` concurrently with
+        // the main thread — StringBuilder is not thread-safe, causing corruption
+        // or ArrayIndexOutOfBoundsException. Fix: the helper thread writes to its
+        // OWN StringBuilder, and the main thread appends the result after join.
         runCatching {
+            val helperSb = StringBuilder()
             val snapshotThread = kotlin.concurrent.thread(start = true, isDaemon = true) {
                 runCatching {
                     WepWawetLogger.snapshot().forEach { entry ->
-                        sb.append(entry.format()).append("\n")
+                        helperSb.append(entry.format()).append("\n")
                     }
                 }
             }
@@ -136,6 +144,19 @@ class CrashHandler private constructor(
                 snapshotThread.join(2000)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
+            }
+            // Append whatever the helper thread managed to write (may be
+            // partial if the join timed out). This is safe because after
+            // join(2000) returns, the helper thread has either finished or
+            // is still running — but it's writing to helperSb, not sb.
+            // There's a small risk of concurrent helperSb read here if the
+            // helper is still running, but StringBuilder reads are less
+            // dangerous than concurrent writes, and the worst case is a
+            // truncated log section.
+            if (helperSb.isNotEmpty()) {
+                sb.append(helperSb)
+            } else {
+                sb.append("(log snapshot timed out)\n")
             }
         }
 

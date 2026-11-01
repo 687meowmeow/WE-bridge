@@ -3693,10 +3693,13 @@ object MpkgPacker {
                 val wx = (fx - sx0).coerceIn(0.0, 1.0)
                 val o = (y * newW + x) * 4
                 for (c in 0 until 4) {
-                    val i00 = ((sy0 * width + sx0) * 4 + c).toByte().toInt() and 0xFF
-                    val i01 = ((sy0 * width + sx1) * 4 + c).toByte().toInt() and 0xFF
-                    val i10 = ((sy1 * width + sx0) * 4 + c).toByte().toInt() and 0xFF
-                    val i11 = ((sy1 * width + sx1) * 4 + c).toByte().toInt() and 0xFF
+                    // v0.7.21 BUG FIX: was `((idx)).toByte().toInt() and 0xFF`
+                    // which converted the INDEX to a byte — never reading the
+                    // rgba array. Now correctly indexes into rgba.
+                    val i00 = rgba[(sy0 * width + sx0) * 4 + c].toInt() and 0xFF
+                    val i01 = rgba[(sy0 * width + sx1) * 4 + c].toInt() and 0xFF
+                    val i10 = rgba[(sy1 * width + sx0) * 4 + c].toInt() and 0xFF
+                    val i11 = rgba[(sy1 * width + sx1) * 4 + c].toInt() and 0xFF
                     val top = i00 + ((i01 - i00) * wx)
                     val bottom = i10 + ((i11 - i10) * wx)
                     out[o + c] = (top + (bottom - top) * wy).toInt().coerceIn(0, 255).toByte()
