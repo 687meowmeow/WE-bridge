@@ -750,6 +750,21 @@ class WePairingServer {
      */
     private fun sendEncryptedJson(output: DataOutputStream, obj: Any) {
         val json = gson.toJson(obj)
+        sendEncryptedJsonString(output, json)
+    }
+
+    /**
+     * v0.7.22: send an AES-encrypted RAW JSON string (not Gson-serialized).
+     *
+     * Used by the heartbeat echo, which must be byte-exact with the real PC:
+     * wallpaperui.exe's handler (disassembled at 0x140039c98–0x140039d60)
+     * builds a fresh JSON value, sets ONLY the "command" member to
+     * "heartbeat" and sends it — the wire bytes are exactly
+     * `{"command":"heartbeat"}`, no other fields. Serializing our
+     * DownloadInfo with Gson would add title/file/size defaults the PC
+     * never sends (harmless to the phone's parser, but not parity).
+     */
+    private fun sendEncryptedJsonString(output: DataOutputStream, json: String) {
         val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
         cipher.init(Cipher.ENCRYPT_MODE, currentAesKey, currentIv)
         val ciphertext = cipher.doFinal(json.toByteArray(Charsets.UTF_8))
@@ -1077,6 +1092,28 @@ class WePairingServer {
                             WepWawetLogger.proxy("Heartbeat received",
                                 "count" to heartbeatCount)
                         }
+                        // v0.7.22 (PC parity, wallpaperui.exe 0x140039c98–
+                        // 0x140039d60): the real PC answers EVERY heartbeat
+                        // with an encrypted {"command":"heartbeat"} echo.
+                        // This is not cosmetic: the official app's
+                        // TransferService routes every received DownloadInfo
+                        // (including the echo) through updateNotification →
+                        // beginIdleDisconnect, which re-arms its 5-second
+                        // idle disconnect — with a real PC the connection
+                        // therefore STAYS ALIVE while backgrounded, and the
+                        // notification keeps refreshing. Without the echo
+                        // (every WepWawet release before v0.7.22) the timer
+                        // fires and the app closes its own socket — the
+                        // recurring "Connection closed: java.net.
+                        // SocketException: Socket closed" entries in the
+                        // user's applog.
+                        try {
+                            sendEncryptedJsonString(output, """{"command":"heartbeat"}""")
+                        } catch (e: Exception) {
+                            WepWawetLogger.proxyWarn("Heartbeat echo failed",
+                                "exception" to e.javaClass.name)
+                            throw e
+                        }
                         // v0.5.32 (audit C4): Spawn the transfer on a
                         // separate thread so this loop can keep READING
                         // heartbeats. Previously `transferWallpaper` was
@@ -1124,6 +1161,48 @@ class WePairingServer {
                             "msg_index" to messageCount,
                             "decrypted_json" to commandJson.take(500))
 
+                        // v0.7.22 (PC parity): mirror wallpaperui.exe's
+                        // post-auth dispatcher (0x140039c39–0x14003a33c)
+                        // exactly:
+                        //   "quit"                    → clean close (no reply)
+                        //   "heartbeat" as a JSON msg  → {"command":"heartbeat"}
+                        //   beginUpload/transmissionStart/transmissionContinue/
+                        //   transmissionCancel         → echo with command+size
+                        //   anything else              → SILENTLY IGNORED —
+                        //   the unknown-command path at 0x14003a33c just
+                        //   cleans up its locals and loops back to the read.
+                        // The previous {"status":"AuthOK"} ack for unknown
+                        // messages was NOT PC behavior: the phone would
+                        // Gson-parse it into a DownloadInfo with command=""
+                        // and route it into its download callback — harmless
+                        // but wrong, and it is gone now.
+                        val command = runCatching {
+                            gson.fromJson(commandJson, DownloadInfo::class.java).command
+                        }.getOrNull()
+                        when (command) {
+                            "quit" -> {
+                                WepWawetLogger.proxy("Phone requested quit — closing connection cleanly",
+                                    "heartbeats_seen" to heartbeatCount,
+                                    "messages_seen" to messageCount)
+                                break
+                            }
+                            "heartbeat" -> {
+                                sendEncryptedJsonString(output, """{"command":"heartbeat"}""")
+                            }
+                            "beginUpload", "transmissionStart", "transmissionCancel" -> {
+                                sendEncryptedJsonString(output, """{"command":"$command"}""")
+                            }
+                            "transmissionContinue" -> {
+                                val size = runCatching {
+                                    gson.fromJson(commandJson, DownloadInfo::class.java).size
+                                }.getOrNull() ?: 0L
+                                sendEncryptedJsonString(output, """{"command":"transmissionContinue","size":$size}""")
+                            }
+                            else -> {
+                                // unknown command — the real PC stays silent
+                            }
+                        }
+
                         // v0.5.32 (audit C4): Spawn on transfer thread
                         // (same fix as heartbeat branch above).
                         val pending = pendingWallpapers.poll()
@@ -1140,28 +1219,6 @@ class WePairingServer {
                             } else {
                                 WepWawetLogger.proxy("Transfer already in progress — re-queueing pending wallpaper (from command)")
                                 pendingWallpapers.add(pending)
-                            }
-                        } else {
-                            // No pending wallpaper — send generic response.
-                            // v0.7.4 note: this deliberately remains an
-                            // {"status":"AuthOK"} ack (unchanged wire behavior).
-                            // The phone's post-pairing command loop primarily
-                            // sends heartbeats (handled above); for any other
-                            // message we ack with AuthOK rather than staying
-                            // silent, because the phone's TcpClient may block
-                            // on a response. Changing the response shape here
-                            // risks breaking the pairing session — keep as-is.
-                            // v0.5.32 (audit C4): synchronized on outputLock
-                            // so this write can't interleave with an
-                            // in-flight transfer thread's writes (which
-                            // would break the phone's command parser).
-                            val encCipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-                            encCipher.init(Cipher.ENCRYPT_MODE, currentAesKey, currentIv)
-                            val respBytes = encCipher.doFinal("""{"status":"AuthOK"}""".toByteArray(Charsets.UTF_8))
-                            synchronized(outputLock) {
-                                writeLeInt(output, respBytes.size)
-                                output.write(respBytes)
-                                output.flush()
                             }
                         }
                     }

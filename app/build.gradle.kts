@@ -437,8 +437,41 @@ android {
         //     thread and helper thread. Helper now writes to its own SB.
         //   - BUG 47 (Medium): videoTrim route passed File("") when
         //     pendingVideoFor returned null. Now pops back immediately.
-        versionCode = 113
-        versionName = "0.7.21-alpha"
+        // v0.7.22-alpha: LINK-TIME PARITY — cross-stage varying harmonization
+        //   + the real PC's heartbeat echo.
+        //   - ShaderStageLink (NEW): the PC's D3D pipeline links shader stages
+        //     by register semantic and never type-checks them, so shipped
+        //     assets can carry cross-stage varying mismatches (effects/glitter:
+        //     glitter_prepare.vert declares vec2 v_TexCoord while the .frag
+        //     declares vec4) that the official Android engine's strict ESSL
+        //     3.00 linker rejects: "Failed linking program effects/
+        //     glitter_prepare (Error: output v_TexCoord type mismatch with
+        //     other stage. Error: Input Output Mismatch.)" — a hard render
+        //     failure for EVERY wallpaper using such an effect (user applog
+        //     2026-11-01; community-confirmed broken even for real PC
+        //     transfers). The new pass runs after the per-file chain over the
+        //     final bytes of every .vert/.frag pair in the package and unifies
+        //     mismatched float-vector varyings fxc-faithfully: the fragment
+        //     declaration is retyped to the vertex type when the fragment only
+        //     reads components the vertex declares (the glitter case), else the
+        //     vertex declaration is upsized with zero-filled constructors.
+        //     Conservative by design: matrices/arrays/shadowed/preprocessor-
+        //     referenced names and .geom chains are skipped; consistent pairs
+        //     are byte-identical (0 rewrites on the real-PC demo corpus).
+        //     Validation: glslangValidator -l over 252 pairs (we-assets
+        //     effects + APK demo mpkgs + engine core) — 0 type mismatches
+        //     after the pipeline; 13 new unit tests; 79/79 total pass.
+        //   - WePairingServer (PC parity, wallpaperui.exe 0x140039c98–
+        //     0x14003a33c): every "heartbeat" is now answered with the
+        //     encrypted {"command":"heartbeat"} echo — this is what keeps the
+        //     official app's 5-second idle-disconnect rescheduled, so
+        //     backgrounded connections stay alive exactly as with a real PC
+        //     (was: silent skip → the recurring "Connection closed:
+        //     java.net.SocketException: Socket closed" churn). Unknown
+        //     commands are now SILENTLY ignored (the AuthOK ack was never PC
+        //     behavior) and "quit" closes cleanly.
+        versionCode = 114
+        versionName = "0.7.22-alpha"
         // Native ABI filter — only build for arm64-v8a (WE app targets Snapdragon 8 Gen 2+)
         ndk {
             abiFilters += "arm64-v8a"

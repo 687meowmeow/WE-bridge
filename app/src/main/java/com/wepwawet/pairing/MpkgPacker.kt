@@ -3447,6 +3447,25 @@ object MpkgPacker {
             WepWawetLogger.proxy("MpkgPacker.fixShaders: fixed $fixedCount shader files (PC-exact pipeline)",
                 "zcompat_substituted" to zcompatSubstitutedCount)
         }
+
+        // 3. Cross-stage varying harmonization (v0.7.22). Runs AFTER the
+        //    per-file chain over the final bytes of every .vert/.frag pair:
+        //    the PC's D3D pipeline links stages by register semantic and
+        //    never type-checks them, so shipped assets (e.g. effects/glitter:
+        //    glitter_prepare.vert declares vec2 v_TexCoord while the .frag
+        //    declares vec4) can carry cross-stage type mismatches that the
+        //    official Android engine's strict ESSL 3.00 linker rejects with
+        //    "Failed linking program effects/glitter_prepare (Error: output
+        //    v_TexCoord type mismatch with other stage. Error: Input Output
+        //    Mismatch.)" — a hard render failure. ShaderStageLink unifies
+        //    the types fxc-faithfully for EVERY wallpaper (see its header
+        //    for the full ground-truth derivation); pairs that already
+        //    match are not touched, so healthy wallpapers pack byte-identically.
+        val linkReport = ShaderStageLink.harmonize(entries)
+        for (line in linkReport) {
+            WepWawetLogger.proxy("MpkgPacker.fixShaders: stage-link harmonization",
+                "detail" to line)
+        }
     }
 
     // ==================== v0.7.4 PARITY HELPERS (G5/G6/G7) ====================

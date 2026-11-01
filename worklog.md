@@ -2444,3 +2444,147 @@ Reminders for future agents:
       the real driver ACCEPTS it — the APK ships live-looking examples.
       We wrap anyway (vec2(1.0) is valid everywhere); the control-set
       failures on this class are driver-lenient, not our bugs.
+
+---
+
+Task ID: v0.7.22-alpha
+Agent: main (link-time parity: cross-stage varying harmonization + the real
+  PC's heartbeat echo)
+
+Task: User supplied applog.txt from the OFFICIAL Wallpaper Engine Android
+  app (2026-11-01) — "read log line by line. there are still errors.
+  perfect parity is not achieved. fix in the exact way the real wallpaper
+  engine does. no errors with every wallpaper like the real wallpaper engine
+  is mandatory. use the exes as the source of truth."
+
+LINE-BY-LINE LOG TRIAGE (37 lines):
+  • lines 2-4, 7-9, 14-16, 20-22, 25-27: DiscoverService "First PC
+    discovered: WallpaperEngine/Ping:07889:WepWawet:4:15F01DB5-…" +
+    "Auto connect" + "Connecting to: /192.168.1.67" — our WeDiscoveryBroadcaster
+    ping being received; each discovery scan round logs its first device.
+    Informational, not errors.
+  • lines 5, 10-12, 17-18, 23, 32: repeated "First PC discovered" during an
+    active connection — the app rescans periodically; still informational.
+  • lines 1, 6, 13, 19, 24: "Connection closed: java.net.SocketException:
+    Socket closed" — the official app's own TcpClient logs this when ITS
+    disconnect() closes the socket under its blocked reader. Root causes
+    decoded from the official APK (TcpClient/TransferService smali):
+    (a) onUnbind → last Activity unbinds + no pending downloads →
+        terminateService() → disconnect() — the app's normal backgrounding;
+    (b) beginIdleDisconnect → 5 s timer → backgroundDisconnect() — THE ONE
+        WE CONTROL: every received DownloadInfo (the PC's heartbeat echo)
+        re-arms that timer through updateNotification → beginIdleDisconnect.
+        Our server never echoed heartbeats, so backgrounded sessions died
+        ~5 s after the last message instead of staying alive like with a
+        real PC. FIXED (see below).
+  • lines 28-30, 33-35: "Failed linking program effects/glitter_prepare
+    (Error: output v_TexCoord type mismatch with other stage. Error:
+    Input Output Mismatch.)" — THE rendering failure. FIXED (see below).
+
+GROUND TRUTH ASSEMBLED (every claim checked against a primary source):
+  • Official APK downloaded from wallpaperengine.io (the direct-download
+    build): assets/shaders/ contains ONLY engine-core shaders — NO effects
+    directory → effect shaders ALWAYS come from the .mpkg; the packer owns
+    their bytes. The APK also ships 9 demo .mpkgs (deep_space…techno) that
+    are REAL PC-produced output — the demo effect pairs (godrays, scroll,
+    depthparallax, filmgrain) all have consistent varyings: 0 mismatches.
+  • libscenejni.so @0x26068a0: plain glCreateShader/glCompileShader/
+    glCreateProgram/glLinkProgram + a #define macro header (#define varying
+    out / #define varying in) — the engine does NO harmonization; the link
+    error text is raw driver output; failure is fatal (program = 0).
+  • wallpaperui.exe packing loop @0x14003f9e9-0x14003ff97: "shaders/" →
+    .vert/.frag/.geom → deprModFix (0x140017dd0) → fixShader (0x140015f20)
+    → pack. fixShader's keep-unchanged set includes ^varying — NO type
+    unification exists anywhere in the PC pipeline (confirmed: zero
+    "varying"/glitter/waterflow strings in resourcecompiler64.exe).
+  • The shipped glitter asset (WE 2.6, 2025-02) itself carries the bug:
+    glitter_prepare.vert = `varying vec2 v_TexCoord`, glitter_prepare.frag
+    = `varying vec4 v_TexCoord` (both variants incl. preview). The frag
+    never uses v_TexCoord — harmless under D3D register linking, fatal
+    under ESSL linking. Community-confirmed broken for REAL PC transfers
+    too (Steam discussion "'Glitter' Effect does not work on mobile
+    wallpaper", 2026-04). Scan of the whole we-assets tree: exactly 2
+    hard-mismatch pairs (glitter_prepare ×2 dirs + cursorripple_apply_force
+    preview). Waterflow/waterripple/fire/shake/reflection declare frag-only
+    v_Scroll — NOT a link error (glslang -l proves: undefined value, and
+    the PC behaves identically) — left untouched.
+  • glslangValidator (Debian glslang-tools 15.2) reproduces the phone's
+    failure 1:1 on the raw pair ("Types must match: vertex stage: vec2
+    v_TexCoord / fragment stage: vec4 v_TexCoord") and passes after the fix.
+    Its residual link complaints were audited: "Precision qualifiers must
+    match" fires on stage-shared UNIFORMS under the engine's own
+    highp-vert/mediump-frag defaults — vhs/xray/twirl/spin/swing all have
+    this property and verifiably render on real phones → glslang
+    over-strictness, not a real error class; "No function definition
+    PerformLighting_V1" is the harness's prototype artifact.
+
+FIXES:
+  A. ShaderStageLink.kt (NEW, ~600 lines) — cross-stage varying
+     harmonization, integrated at the end of MpkgPacker.fixShadersForMobile
+     over the final bytes of every .vert/.frag pair (stems with .geom are
+     skipped — engine-core particle shaders never appear in mpkgs and reach
+     varyings through IN./v. structs). Two fxc-faithful paths:
+       Path A: fragment reads only components the vertex declares (incl.
+         "never reads it", glitter) → retype the FRAGMENT declaration to
+         the vertex type; whole-var fragment reads keep their expression
+         type via the old-size swizzle.
+       Path B: fragment reads beyond the vertex size → retype (upsize) the
+         VERTEX declaration; whole-var writes get zero-filled constructors
+         (vec4(expr, 0.0, 0.0)); whole-var reads keep their type via the
+         old-size swizzle. Zero-fill is a deterministic value inside D3D's
+         undefined-register envelope.
+     Conservative guards: float/vec2/vec3/vec4 only; single-decl names only
+     (combo-conditional types like genericparticle's SPRITESHEET
+     v_TexCoord are left alone when per-combo consistent); multi-name
+     declarations, gl_ names, arrays, matrices, names shadowed by locals/
+     parameters, names referenced in preprocessor lines, and compound
+     assignments on the upsize path are all SKIPPED. Idempotent.
+  B. WePairingServer.commandLoop — wallpaperui.exe parity:
+     • heartbeat → sendEncryptedJsonString({"command":"heartbeat"}) — the
+       byte-exact echo the real PC builds at 0x140039c98 (fresh JSON value,
+       only the "command" member; NOT Gson-serialized DownloadInfo with
+       title/file/size defaults).
+     • unknown JSON commands → silence (the PC's 0x14003a33c path just
+       loops; the old {"status":"AuthOK"} ack was never PC behavior).
+     • "quit" → clean close (0x14003a3bd).
+     • beginUpload/transmissionStart/transmissionContinue/transmissionCancel
+       from the phone → echoed like the PC's dispatcher (defensive parity;
+       the current phone never sends them).
+
+VERIFICATION (all automated this session):
+  • ShaderStageLinkTest: 13/13 (glitter exact-pair fix, cursorripple,
+    consistent no-op, frag-only no-op, Path B upsize with write-wrap +
+    read-swizzle, shadow guard, preproc guard, compound guard, matrix/array
+    guard, idempotence, non-pair ignore, precision-qualifier preservation).
+  • Full suite: 79/79 (32 PcPipelineTest + 34 ShaderEsslSafetyTest + 13
+    new) — the three byte-exact PC ground-truth shader outputs and texture
+    rebuilds still reproduce the PC byte-for-byte.
+  • Full compile of MpkgPacker.kt + WePairingServer.kt + the pure pipeline
+    against Android API stubs: ZERO errors (kotlinc 2.0.21, restored).
+  • Link sweep (glslangValidator -l, engine's exact header/combos/
+    includes): we-assets effects 173 pairs → 3 rewrites (the broken ones),
+    0 type-mismatch failures; APK demo mpkgs 23 pairs → 0 rewrites
+    (byte-identical — no regression on real PC output), 0 failures; APK
+    engine-core 53 pairs → 0 rewrites. Static scan of all 252 processed
+    pairs: 0 mismatches.
+  • End-to-end through the REAL MpkgPacker.fixShadersForMobile (reflection
+    harness): glitter_prepare.frag ships `varying vec2 v_TexCoord` matched
+    with the vertex; consistent glitter_combine untouched at vec4.
+
+Reminders for future agents:
+  64. Cross-stage type unification lives in ShaderStageLink; the PC has NO
+      such pass (shipped glitter is broken on real PCs' Android transfers
+      too) — we deliberately go one step BEYOND byte parity here because
+      "no errors with every wallpaper" is the user's hard requirement. The
+      PC-exact per-file chain (deprModFix/fixShader/ESSL safety) is
+      untouched and still byte-verified.
+  65. glslang's link check is stricter than real drivers in two audited
+      ways (stage-shared uniform default precision, LightingV1 prototype
+      bodies). Only "Types must match" corresponds to real phone failures.
+  66. The heartbeat echo is load-bearing for connection lifetime: the
+      official app's TransferService re-arms its 5 s idle disconnect on
+      every received DownloadInfo, echo included. Never "optimize" it away.
+  67. The official app logs "Connection closed: SocketException" whenever
+      it backgrounds itself with no pending downloads (onUnbind →
+      terminateService). That line alone is normal lifecycle — only its
+      FREQUENCY (fixed by the echo) was a real defect.
