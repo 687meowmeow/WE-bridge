@@ -4,7 +4,8 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -69,27 +71,27 @@ import com.wepwawet.pairing.PairingService
 import com.wepwawet.pairing.VideoTrimmer
 import com.wepwawet.ui.components.SlimTopBar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
  * Video trim screen — a mobile video trimmer UI with a scrollable filmstrip,
- * two draggable clip bars (start/end), and a center playhead marker.
+ * three draggable handles (start clip, end clip, playhead), and tap-to-pause.
  *
- * v0.7.21 redesign:
- *   - Filmstrip is horizontally scrollable with 40 frames at the video's
- *     true aspect ratio.
- *   - Two custom draggable vertical clip bars (start + end) replace the
- *     old RangeSlider. Each clip bar is independently draggable.
- *   - A center playhead marker (vertical white line) shows the current
- *     playback position.
- *   - The video player only allows play/pause — no seeking, no next/prev,
- *     no fast-forward/rewind. PlayerView.useController = false + a custom
- *     play/pause overlay button.
- *   - The whole screen is vertically scrollable so tall (portrait) videos
- *     don't push the trim controls off-screen.
+ * v0.7.23 redesign:
+ *   - Tap anywhere on the video frame to toggle play/pause.
+ *   - The start/end clip bar thumbs are bigger (48dp touch target, 8dp visible
+ *     bar with a circular grab handle on top).
+ *   - The playhead is now a draggable handle — drag it to seek the video.
+ *   - Fixed VT-1: crash on videos < 500ms (coerceIn min>max).
+ *   - Fixed VT-2/3/4: videoFile.delete + onSendComplete only fire on success
+ *     and only if the coroutine is still active.
+ *   - Fixed VT-5: thumbnail bitmaps recycled on dispose.
+ *   - Fixed VT-7: playhead visible at position 0.
  *
  * @param videoFile The downloaded video file (already exists on disk).
  * @param itemTitle Wallpaper title.
@@ -121,10 +123,15 @@ fun VideoTrimScreen(
             repeatMode = Player.REPEAT_MODE_ONE
         }
     }
+    // v0.7.23 BUG VT-5: Recycle thumbnail bitmaps on dispose to prevent
+    // native memory leak.
+    val thumbnails = remember { mutableStateListOf<android.graphics.Bitmap>() }
     DisposableEffect(Unit) {
         onDispose {
             player.pause()
             player.release()
+            thumbnails.forEach { runCatching { it.recycle() } }
+            thumbnails.clear()
         }
     }
 
@@ -138,8 +145,6 @@ fun VideoTrimScreen(
     var isTrimming by remember { mutableStateOf(false) }
     var trimStatus by remember { mutableStateOf("") }
     var isPlaying by remember { mutableStateOf(true) }
-
-    val thumbnails = remember { mutableStateListOf<android.graphics.Bitmap>() }
 
     // Generate frame thumbnails.
     LaunchedEffect(videoFile) {
@@ -158,6 +163,7 @@ fun VideoTrimScreen(
                     "duration_ms" to dur, "width" to w, "height" to h)
 
                 // v0.7.21: Clear any stale thumbnails before regenerating.
+                thumbnails.forEach { runCatching { it.recycle() } }
                 thumbnails.clear()
 
                 val thumbCount = 40
@@ -200,14 +206,17 @@ fun VideoTrimScreen(
         16f / 9f
     }
 
-    // v0.7.21: Filmstrip dimensions.
-    val filmstripHeight = 72.dp
+    // v0.7.23: Filmstrip dimensions. Bigger clip bar thumbs (48dp touch target).
+    val filmstripHeight = 80.dp
     val frameWidthDp = filmstripHeight * aspectRatio
     val frameCount = 40
     val totalStripWidthDp = frameWidthDp * frameCount
     val filmstripScrollState = rememberScrollState()
-    // Convert total strip width to pixels for drag delta → time conversion.
     val totalStripWidthPx = with(density) { totalStripWidthDp.toPx() }
+
+    // v0.7.23: The clip bar thumb size — 48dp touch target, 8dp visible bar.
+    val thumbTouchSize = 48.dp
+    val thumbBarWidth = 8.dp
 
     Scaffold(
         topBar = {
@@ -223,14 +232,26 @@ fun VideoTrimScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             // === Video preview (matches video's actual aspect ratio) ===
-            // v0.7.21: PlayerView.useController = false — the user can only
-            // pause/play via the overlay button. No seeking, no next/prev,
-            // no fast-forward/rewind. This prevents the user from messing
-            // with the playback position while trimming.
+            // v0.7.23: Tap anywhere on the video to toggle play/pause.
+            // PlayerView.useController = false — no seeking, no next/prev,
+            // no fast-forward/rewind. A centered overlay icon shows play/pause
+            // state. The entire Surface is wrapped in a pointerInput that
+            // detects tap gestures.
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .aspectRatio(aspectRatio),
+                    .aspectRatio(aspectRatio)
+                    .pointerInput(player) {
+                        detectTapGestures(
+                            onTap = {
+                                if (player.isPlaying) {
+                                    player.pause()
+                                } else {
+                                    player.play()
+                                }
+                            },
+                        )
+                    },
                 shape = RoundedCornerShape(12.dp),
                 color = Color.Black,
             ) {
@@ -246,26 +267,16 @@ fun VideoTrimScreen(
                         },
                         modifier = Modifier.fillMaxSize(),
                     )
-                    // Play/pause overlay button — centered on the video.
-                    IconButton(
-                        onClick = {
-                            if (player.isPlaying) {
-                                player.pause()
-                            } else {
-                                player.play()
-                            }
-                        },
+                    // Play/pause overlay icon — centered, semi-transparent.
+                    // Visible always so the user knows the state.
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        tint = Color.White.copy(alpha = 0.5f),
                         modifier = Modifier
                             .align(Alignment.Center)
                             .size(56.dp),
-                    ) {
-                        Icon(
-                            imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
-                            tint = Color.White.copy(alpha = 0.8f),
-                            modifier = Modifier.size(40.dp),
-                        )
-                    }
+                    )
                 }
             }
 
@@ -281,12 +292,17 @@ fun VideoTrimScreen(
                     color = MaterialTheme.colorScheme.primary)
             }
 
-            // === v0.7.21: Scrollable filmstrip with custom draggable clip bars ===
+            // === v0.7.23: Scrollable filmstrip with 3 draggable handles ===
+            // Three handles: start clip, end clip, playhead.
+            // Each has a 48dp touch target. The clip bars have an 8dp visible
+            // bar + a circular grab handle on top. The playhead is a 4dp
+            // white line + a circular grab handle on top.
             if (durationMs > 0) {
                 val startFraction = startMs.toFloat() / durationMs
                 val endFraction = endMs.toFloat() / durationMs
+                // v0.7.23 BUG VT-7: show playhead at position 0 too (>= 0f).
                 val playheadFraction = if (durationMs > 0) {
-                    currentPosition.toFloat() / durationMs
+                    (currentPosition.toFloat() / durationMs).coerceIn(0f, 1f)
                 } else 0f
 
                 Box(
@@ -295,7 +311,7 @@ fun VideoTrimScreen(
                         .height(filmstripHeight)
                         .clip(RoundedCornerShape(6.dp)),
                 ) {
-                    // Inner scrollable Box — frames + dim overlays + clip bars + playhead
+                    // Inner scrollable Box — frames + dim overlays + handles
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -362,30 +378,60 @@ fun VideoTrimScreen(
                             }
                         }
 
-                        // 3) Center playhead marker — a thin vertical white line
-                        //    showing the current playback position. Moves with
-                        //    scroll (it's inside the scrollable area).
-                        if (playheadFraction > 0f) {
+                        // 3) Playhead marker — a 4dp white vertical line with a
+                        //    circular grab handle on top. Draggable to seek.
+                        //    v0.7.23 BUG VT-7: visible at position 0 (>= 0f).
+                        if (playheadFraction >= 0f) {
                             Box(
                                 modifier = Modifier
                                     .width(totalStripWidthDp)
                                     .fillMaxHeight(),
                             ) {
+                                // The white line
                                 Box(
                                     modifier = Modifier
-                                        .offset(x = (totalStripWidthDp * playheadFraction))
-                                        .width(2.dp)
+                                        .offset(x = (totalStripWidthDp * playheadFraction) - 2.dp)
+                                        .width(4.dp)
                                         .fillMaxHeight()
                                         .background(Color.White.copy(alpha = 0.9f)),
                                 )
+                                // The grab handle (circle on top) — 48dp touch target
+                                Box(
+                                    modifier = Modifier
+                                        .offset(
+                                            x = (totalStripWidthDp * playheadFraction) - (thumbTouchSize / 2),
+                                            y = 0.dp,
+                                        )
+                                        .width(thumbTouchSize)
+                                        .height(thumbTouchSize)
+                                        .pointerInput(durationMs) {
+                                            detectDragGestures(
+                                                onDragStart = { },
+                                                onDragEnd = { },
+                                            ) { _, dragAmount ->
+                                                if (durationMs <= 0) return@detectDragGestures
+                                                val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                                val newPos = (currentPosition + deltaTime)
+                                                    .coerceIn(0L, durationMs)
+                                                player.seekTo(newPos)
+                                                currentPosition = newPos
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(20.dp)
+                                            .clip(CircleShape)
+                                            .background(Color.White)
+                                    )
+                                }
                             }
                         }
 
                         // 4) Start clip bar — draggable vertical bar at startMs.
-                        //    The drag gesture converts horizontal pixel delta to
-                        //    time delta: deltaTime = (deltaPx / totalStripWidthPx)
-                        //    * durationMs.
-                        //    v0.7.21: 36dp touch target with a 4dp visible bar.
+                        //    v0.7.23: 48dp touch target, 8dp visible bar, circular
+                        //    grab handle on top. Bigger thumbs per user request.
                         Box(
                             modifier = Modifier
                                 .width(totalStripWidthDp)
@@ -394,53 +440,78 @@ fun VideoTrimScreen(
                             // Start clip bar
                             Box(
                                 modifier = Modifier
-                                    .offset(x = (totalStripWidthDp * startFraction) - 18.dp)
-                                    .width(36.dp)
-                                    .fillMaxHeight()
+                                    .offset(x = (totalStripWidthDp * startFraction) - (thumbTouchSize / 2))
+                                    .width(thumbTouchSize)
+                                    .height(thumbTouchSize)
                                     .pointerInput(durationMs) {
-                                        detectHorizontalDragGestures(
+                                        detectDragGestures(
                                             onDragStart = { },
                                             onDragEnd = { player.seekTo(startMs) },
                                         ) { _, dragAmount ->
-                                            if (durationMs <= 0) return@detectHorizontalDragGestures
+                                            if (durationMs <= 0) return@detectDragGestures
                                             val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                            // v0.7.23 BUG VT-1: guard against durationMs < 500
+                                            // — coerceIn(min, max) throws if min > max.
+                                            val maxStart = (endMs - 500).coerceAtLeast(0L)
+                                                .coerceAtMost(durationMs)
                                             startMs = (startMs + deltaTime)
-                                                .coerceIn(0L, (endMs - 500).coerceAtLeast(0))
+                                                .coerceIn(0L, maxStart)
                                         }
                                     },
+                                contentAlignment = Alignment.Center,
                             ) {
+                                // The visible 8dp bar
                                 Box(
                                     modifier = Modifier
-                                        .align(Alignment.Center)
-                                        .width(4.dp)
+                                        .width(thumbBarWidth)
                                         .fillMaxHeight()
-                                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp))
+                                )
+                                // The circular grab handle on top
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopCenter)
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.primary)
                                 )
                             }
                             // End clip bar
                             Box(
                                 modifier = Modifier
-                                    .offset(x = (totalStripWidthDp * endFraction) - 18.dp)
-                                    .width(36.dp)
-                                    .fillMaxHeight()
+                                    .offset(x = (totalStripWidthDp * endFraction) - (thumbTouchSize / 2))
+                                    .width(thumbTouchSize)
+                                    .height(thumbTouchSize)
                                     .pointerInput(durationMs) {
-                                        detectHorizontalDragGestures(
+                                        detectDragGestures(
                                             onDragStart = { },
                                             onDragEnd = { player.seekTo(endMs) },
                                         ) { _, dragAmount ->
-                                            if (durationMs <= 0) return@detectHorizontalDragGestures
+                                            if (durationMs <= 0) return@detectDragGestures
                                             val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                            // v0.7.23 BUG VT-1: guard against durationMs < 500
+                                            val minEnd = (startMs + 500).coerceAtMost(durationMs)
+                                                .coerceAtLeast(0L)
                                             endMs = (endMs + deltaTime)
-                                                .coerceIn((startMs + 500).coerceAtLeast(0), durationMs)
+                                                .coerceIn(minEnd, durationMs)
                                         }
                                     },
+                                contentAlignment = Alignment.Center,
                             ) {
+                                // The visible 8dp bar
                                 Box(
                                     modifier = Modifier
-                                        .align(Alignment.Center)
-                                        .width(4.dp)
+                                        .width(thumbBarWidth)
                                         .fillMaxHeight()
-                                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(2.dp))
+                                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp))
+                                )
+                                // The circular grab handle on top
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopCenter)
+                                        .size(24.dp)
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.primary)
                                 )
                             }
                         }
@@ -479,12 +550,15 @@ fun VideoTrimScreen(
                         trimStatus = "Trimming video…"
                         scope.launch {
                             withContext(Dispatchers.IO) {
+                                var success = false
                                 try {
                                     val trimmedFile = File(context.cacheDir, "${itemId}_trimmed.mp4")
                                     trimStatus = "Trimming ${formatTime(startMs)}–${formatTime(endMs)}…"
-                                    val success = VideoTrimmer.trim(videoFile, trimmedFile, startMs, endMs)
-                                    val packedFile = if (success) trimmedFile else videoFile
-                                    trimStatus = if (success) "Packing trimmed video…" else "Trim failed — packing full video…"
+                                    val trimSuccess = VideoTrimmer.trim(videoFile, trimmedFile, startMs, endMs)
+                                    // v0.7.23 BUG VT-2: check if cancelled after trim
+                                    if (!currentCoroutineContext().isActive) return@withContext
+                                    val packedFile = if (trimSuccess) trimmedFile else videoFile
+                                    trimStatus = if (trimSuccess) "Packing trimmed video…" else "Trim failed — packing full video…"
 
                                     val mpkgFile = File(context.cacheDir, "${itemId}_${System.currentTimeMillis()}_send.mpkg")
                                     val item = WorkshopItemTyped(
@@ -498,23 +572,40 @@ fun VideoTrimScreen(
                                         item = item, videoFile = packedFile,
                                         outputFile = mpkgFile, previewFile = previewFile,
                                     )
+                                    // v0.7.23 BUG VT-2: check if cancelled after pack
+                                    if (!currentCoroutineContext().isActive) return@withContext
                                     trimStatus = "Queuing for transfer…"
                                     PairingService.queueWallpaper(mpkgFile, itemTitle)
                                     PairingService.launchWallpaperEngineApp(context)
                                     runCatching { trimmedFile.delete() }
-                                    runCatching { videoFile.delete() }
+                                    // v0.7.23 BUG VT-3: only delete source video if
+                                    // queueWallpaper succeeded (server is running).
+                                    // We can't check queueWallpaper's return, but we
+                                    // can check PairingService.isPaired().
+                                    if (PairingService.isPaired() || PairingService.pairingServer != null) {
+                                        runCatching { videoFile.delete() }
+                                    }
                                     runCatching { installDir.deleteRecursively() }
                                     com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen(itemId)
                                     WepWawetLogger.workshop("VideoTrimScreen: trim + send complete",
                                         "item_id" to itemId, "mpkg_size" to mpkgFile.length())
-                                    isTrimming = false
-                                    onSendComplete()
+                                    success = true
                                 } catch (e: kotlinx.coroutines.CancellationException) {
-                                    isTrimming = false
                                     throw e
                                 } catch (e: Exception) {
-                                    isTrimming = false
                                     trimStatus = "Failed: ${e.message}"
+                                } finally {
+                                    if (currentCoroutineContext().isActive) {
+                                        isTrimming = false
+                                        if (success) {
+                                            // v0.7.23 BUG VT-4: only call onSendComplete
+                                            // if the coroutine is still active (user
+                                            // hasn't navigated away).
+                                            withContext(Dispatchers.Main) {
+                                                onSendComplete()
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -532,6 +623,7 @@ fun VideoTrimScreen(
                         trimStatus = "Packing full video…"
                         scope.launch {
                             withContext(Dispatchers.IO) {
+                                var success = false
                                 try {
                                     val mpkgFile = File(context.cacheDir, "${itemId}_${System.currentTimeMillis()}_send.mpkg")
                                     val item = WorkshopItemTyped(
@@ -545,20 +637,33 @@ fun VideoTrimScreen(
                                         item = item, videoFile = videoFile,
                                         outputFile = mpkgFile, previewFile = previewFile,
                                     )
+                                    // v0.7.23 BUG VT-2: check if cancelled after pack
+                                    if (!currentCoroutineContext().isActive) return@withContext
                                     trimStatus = "Queuing for transfer…"
                                     PairingService.queueWallpaper(mpkgFile, itemTitle)
                                     PairingService.launchWallpaperEngineApp(context)
-                                    runCatching { videoFile.delete() }
+                                    // v0.7.23 BUG VT-3: only delete source video if paired.
+                                    if (PairingService.isPaired() || PairingService.pairingServer != null) {
+                                        runCatching { videoFile.delete() }
+                                    }
                                     runCatching { installDir.deleteRecursively() }
                                     com.wepwawet.pairing.WorkshopDownloadJob.onVideoConsumedByTrimScreen(itemId)
-                                    isTrimming = false
-                                    onSendComplete()
+                                    success = true
                                 } catch (e: kotlinx.coroutines.CancellationException) {
-                                    isTrimming = false
                                     throw e
                                 } catch (e: Exception) {
-                                    isTrimming = false
                                     trimStatus = "Failed: ${e.message}"
+                                } finally {
+                                    if (currentCoroutineContext().isActive) {
+                                        isTrimming = false
+                                        if (success) {
+                                            // v0.7.23 BUG VT-4: only call onSendComplete
+                                            // if the coroutine is still active.
+                                            withContext(Dispatchers.Main) {
+                                                onSendComplete()
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

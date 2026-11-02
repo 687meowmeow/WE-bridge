@@ -57,6 +57,17 @@ class WorkshopRepository constructor(
     private var currentPage: Int = 0
     @Volatile private var hasMore: Boolean = true
 
+    /**
+     * v0.7.23: The last filter that was passed to [startBrowse]. Used by
+     * WorkshopBrowserScreen to detect whether a filter change should trigger
+     * a new browse session. Hoisted here (singleton) so it survives navigation
+     * to detail and back — the old `remember` in WorkshopBrowserScreen was
+     * lost on navigation, causing a spurious startBrowse on every return.
+     */
+    @Volatile
+    var lastStartBrowseFilter: Filter? = null
+        private set
+
     // v0.5.12-alpha: track consecutive empty pages (pages where the API returned
     // items but client-side applyClientFilters filtered all of them out). After
     // MAX_CONSECUTIVE_EMPTY_PAGES consecutive empties, give up and set hasMore=false
@@ -164,6 +175,9 @@ class WorkshopRepository constructor(
     suspend fun startBrowse(filter: Filter) {
         browseLock.withLock {
             currentFilter = filter
+            // v0.7.23: Track the last filter so WorkshopBrowserScreen can
+            // detect whether a filter change should trigger a new browse.
+            lastStartBrowseFilter = filter
             currentPage = 0
             hasMore = true
             consecutiveEmptyPages = 0  // v0.5.12-alpha: reset on new browse session

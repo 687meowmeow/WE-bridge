@@ -105,11 +105,17 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         runCatching { WepWawetLogger.lifecycle("MainActivity.onResume") }
+        // v0.7.23: Cancel the background time limit — the user is actively
+        // using the app, so no time limit applies.
+        runCatching { com.wepwawet.pairing.PairingService.cancelBackgroundTimeout() }
     }
 
     override fun onPause() {
         super.onPause()
         runCatching { WepWawetLogger.lifecycle("MainActivity.onPause") }
+        // v0.7.23: Start the background time limit — the app is going to
+        // the background. After 30 minutes, the proxy will stop itself.
+        runCatching { com.wepwawet.pairing.PairingService.startBackgroundTimeout() }
     }
 
     override fun onDestroy() {

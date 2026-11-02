@@ -1133,7 +1133,12 @@ object WorkshopDownloadJob {
                 val deviceName = PairingService.pairedDeviceName ?: "phone"
                 PairingService.queueWallpaper(cacheMpkg, pendingItem.title)
                 PairingService.launchWallpaperEngineApp(appContext)
-                runCatching { videoFile.delete() }
+                // v0.7.23 BUG WD-2: only delete the source video if the
+                // pairing server is running (queueWallpaper silently returns
+                // if pairingServer is null). Prevents silent data loss.
+                if (PairingService.pairingServer != null) {
+                    runCatching { videoFile.delete() }
+                }
                 // v0.7.4: clean up the install dir here too (the video path in
                 // launchSendToPhone returns early before the normal cleanup —
                 // this is the continuation of that flow, so it owns the cleanup).
@@ -1251,12 +1256,22 @@ object WorkshopDownloadJob {
         jobs[itemId]?.cancel()
         jobs.remove(itemId)
         onDownloadCancelled(itemId)
+        // v0.7.23 BUG WD-1: Clear pending-video state + delete the file so
+        // the trim dialog doesn't reappear after a cancel from the Downloads
+        // screen.
+        val pendingFile = _states.value[itemId]?.pendingVideoFile
+        if (pendingFile != null) {
+            runCatching { File(pendingFile).delete() }
+        }
         updateState(itemId) { it.copy(
             isRunning = false,
             status = "Cancelled",
             errorMessage = "Cancelled",
             progress = 0f,
             endedAt = System.currentTimeMillis(),
+            // v0.7.23 BUG WD-1: clear pending-video state.
+            pendingVideoFile = null,
+            pendingVideoItem = null,
         ) }
     }
 

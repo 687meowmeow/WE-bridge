@@ -225,7 +225,7 @@ fun WorkshopBrowserScreen(
     // saved filter values. Prevents the per-key save effects from overwriting
     // the saved values with the defaults before the load has had a chance to
     // apply them.
-    var filterLoaded by remember { mutableStateOf(false) }
+    var filterLoaded by rememberSaveable { mutableStateOf(false) }
 
     // === User-controlled filter state (initialized to defaults; overwritten
     //     by LaunchedEffect(Unit) if a saved value exists) ===
@@ -420,7 +420,11 @@ fun WorkshopBrowserScreen(
     // creator mode where the search bar is hidden), call
     // `repo.startSearch(query, filter)` to re-fetch page 1 with the new
     // filter applied. Otherwise, switch to browse mode as before.
-    val lastStartBrowseFilter = remember { androidx.compose.runtime.mutableStateOf<WorkshopRepository.Filter?>(null) }
+    //
+    // v0.7.23 BUG WB-1: lastStartBrowseFilter was `remember` (lost on
+    // navigation), causing a spurious startBrowse on every return from
+    // detail. Now reads from repo.lastStartBrowseFilter (singleton, hoisted
+    // to WorkshopRepository so it survives navigation).
     LaunchedEffect(Unit) {
         snapshotFlow {
             if (filterLoaded) currentFilter() else null
@@ -428,8 +432,7 @@ fun WorkshopBrowserScreen(
             .distinctUntilChanged()
             .filterNotNull()
             .collect { filter ->
-                if (filter != lastStartBrowseFilter.value) {
-                    lastStartBrowseFilter.value = filter
+                if (filter != repo.lastStartBrowseFilter) {
                     val currentQuery = query  // snapshot the State<String>
                     if (!isCreatorMode && currentQuery.isNotBlank()) {
                         // v0.7.1: In search mode — re-run the search with

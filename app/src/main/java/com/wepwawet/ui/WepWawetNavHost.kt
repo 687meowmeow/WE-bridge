@@ -252,9 +252,15 @@ fun WepWawetNavHost() {
             // the user deep-linked to this route without a pending video),
             // pop back immediately instead of showing a broken trim screen
             // with File("") that ExoPlayer can't load.
+            //
+            // v0.7.23 BUG NAV-1: popBackStack was called during composition
+            // which can cause a blank frame or IllegalStateException. Now
+            // wrapped in LaunchedEffect so it's deferred to after composition.
             if (trimVideoPath == null) {
                 WepWawetLogger.lifecycle("NavHost videoTrim: no pending video — popping back")
-                nav.popBackStack()
+                androidx.compose.runtime.LaunchedEffect(Unit) {
+                    nav.popBackStack()
+                }
                 return@composable
             }
             VideoTrimScreen(

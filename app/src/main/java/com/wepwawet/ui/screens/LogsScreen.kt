@@ -156,6 +156,12 @@ fun LogsScreen(onBack: () -> Unit) {
                     }
                     isDownloading = false
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // v0.7.23 BUG LS-1: re-throw CancellationException — was
+                // swallowed by catch (e: Exception) which showed a spurious
+                // "Error" toast when the user navigated away mid-download.
+                isDownloading = false
+                throw e
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     downloadStatus = "Error: ${e.message}"

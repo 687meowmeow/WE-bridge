@@ -470,8 +470,37 @@ android {
         //     java.net.SocketException: Socket closed" churn). Unknown
         //     commands are now SILENTLY ignored (the AuthOK ack was never PC
         //     behavior) and "quit" closes cleanly.
-        versionCode = 114
-        versionName = "0.7.22-alpha"
+        // v0.7.23-alpha: VideoTrim redesign + background time limit + page preservation + bug fixes.
+        //   - VideoTrim: tap anywhere on the video frame to toggle play/pause.
+        //     Bigger clip bar thumbs (48dp touch target, 8dp visible bar with
+        //     circular grab handles). The playhead is now a draggable handle —
+        //     drag it to seek the video.
+        //   - PairingService: 30-minute background time limit. The proxy stops
+        //     itself after 30 minutes in the background. Timer is cancelled
+        //     when the app comes to the foreground (MainActivity.onResume) and
+        //     re-started when the app goes to the background (onPause).
+        //   - WorkshopBrowser: page preservation fixed. lastStartBrowseFilter
+        //     hoisted to WorkshopRepository (singleton) — was `remember` which
+        //     was lost on navigation, causing a spurious startBrowse on every
+        //     return from detail. filterLoaded changed to rememberSaveable.
+        //   - BUG VT-1 (Critical): crash on videos < 500ms (coerceIn min>max).
+        //   - BUG VT-2/3/4: videoFile.delete + onSendComplete only fire on
+        //     success and only if the coroutine is still active. Source video
+        //     only deleted if pairing server is running.
+        //   - BUG VT-5: thumbnail bitmaps recycled on dispose (memory leak fix).
+        //   - BUG VT-7: playhead visible at position 0.
+        //   - BUG NAV-1: popBackStack during composition → wrapped in
+        //     LaunchedEffect.
+        //   - BUG WD-1: cancel(itemId) now clears pending-video state + deletes
+        //     the file.
+        //   - BUG WD-2: continueVideoSend only deletes source video if
+        //     pairingServer is running.
+        //   - BUG LS-1: LogsScreen catch(Exception) now re-throws
+        //     CancellationException.
+        //   - BUG PS-1: notificationDeletedReceiver Handler + Runnable hoisted
+        //     to fields, removed in onDestroy (500ms leak fix).
+        versionCode = 115
+        versionName = "0.7.23-alpha"
         // Native ABI filter — only build for arm64-v8a (WE app targets Snapdragon 8 Gen 2+)
         ndk {
             abiFilters += "arm64-v8a"

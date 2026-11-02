@@ -76,10 +76,45 @@ class PairingService : Service() {
          */
         const val ACTION_NOTIFICATION_DELETED = "com.wepwawet.pairing.NOTIFICATION_DELETED"
 
+        /**
+         * v0.7.23: The maximum time the proxy is allowed to run in the
+         * background (30 minutes). After this limit, the service stops itself.
+         * The timer starts when the app goes to the background and is cancelled
+         * when the app returns to the foreground. This prevents the proxy from
+         * running indefinitely and draining battery.
+         */
+        const val BACKGROUND_TIMEOUT_MS = 30L * 60 * 1000 // 30 minutes
+
         /** v0.7.21: The last notification text — used by the delete receiver to
          *  re-post the notification with the correct text. */
         @Volatile
         var lastNotificationText: String = "WepWawet proxy running"
+
+        /**
+         * v0.7.23: Weak reference to the currently-running PairingService
+         * instance. Used by the static [startBackgroundTimeout] and
+         * [cancelBackgroundTimeout] methods so MainActivity can control the
+         * background time limit without holding a strong reference to the
+         * service (which would prevent GC).
+         */
+        @Volatile
+        private var instance: java.lang.ref.WeakReference<PairingService>? = null
+
+        /**
+         * v0.7.23: Called by MainActivity.onResume to cancel the background
+         * time limit (the user is in the foreground, no limit applies).
+         */
+        fun cancelBackgroundTimeout() {
+            instance?.get()?.cancelBackgroundTimeoutInternal()
+        }
+
+        /**
+         * v0.7.23: Called by MainActivity.onPause to start the background
+         * time limit (the app is going to the background).
+         */
+        fun startBackgroundTimeout() {
+            instance?.get()?.startBackgroundTimeoutInternal()
+        }
 
         // ====== PIN persistence (v0.7.0) ======
         // The user can now set a custom PIN in Settings. It's persisted in
@@ -245,6 +280,37 @@ class PairingService : Service() {
     private var discoveryBroadcaster: WeDiscoveryBroadcaster? = null
 
     /**
+     * v0.7.23: The Handler used for the notification re-post delay + the
+     * background time limit. Hoisted to a field so we can remove callbacks
+     * in onDestroy (BUG PS-1 fix).
+     */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * v0.7.23: The Runnable that re-posts the notification after the user
+     * swipes it away. Hoisted to a field so we can remove it in onDestroy.
+     */
+    private val repostNotificationRunnable = Runnable {
+        if (pairingServerLocal != null || discoveryBroadcaster != null) {
+            updateNotification(lastNotificationText)
+            WepWawetLogger.proxy("PairingService: notification re-posted after user dismissal")
+        }
+    }
+
+    /**
+     * v0.7.23: The Runnable that stops the service after the background time
+     * limit (30 minutes). Started when the app goes to the background, cancelled
+     * when the app returns to the foreground. This prevents the proxy from
+     * running indefinitely in the background and draining battery.
+     */
+    private val backgroundTimeoutRunnable = Runnable {
+        WepWawetLogger.proxy("PairingService: background time limit reached (30 min) — stopping service")
+        stopServers()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    /**
      * v0.7.21: Dynamically-registered receiver that catches the notification's
      * delete intent (fired when the user swipes the notification away) and
      * re-posts the notification after a 500ms delay.
@@ -254,17 +320,17 @@ class PairingService : Service() {
      * auto-repost. This receiver is the workaround: it catches the dismissal
      * and immediately re-posts the notification, so the notification always
      * stays visible while the proxy is running.
+     *
+     * v0.7.23 BUG PS-1: The Handler + Runnable are now hoisted to fields
+     * (mainHandler + repostNotificationRunnable) so they can be removed in
+     * onDestroy, preventing a 500ms service leak.
      */
     private val notificationDeletedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == ACTION_NOTIFICATION_DELETED) {
                 WepWawetLogger.proxy("PairingService: notification dismissed by user — re-posting in 500ms")
-                Handler(Looper.getMainLooper()).postDelayed({
-                    if (pairingServerLocal != null || discoveryBroadcaster != null) {
-                        updateNotification(lastNotificationText)
-                        WepWawetLogger.proxy("PairingService: notification re-posted after user dismissal")
-                    }
-                }, 500)
+                mainHandler.removeCallbacks(repostNotificationRunnable)
+                mainHandler.postDelayed(repostNotificationRunnable, 500)
             }
         }
     }
@@ -293,7 +359,40 @@ class PairingService : Service() {
         } else {
             registerReceiver(notificationDeletedReceiver, filter)
         }
+        // v0.7.23: Store a weak reference to this instance so the static
+        // startBackgroundTimeout/cancelBackgroundTimeout methods can access it.
+        instance = java.lang.ref.WeakReference(this)
+        // v0.7.23: Start the background time limit. The timer is cancelled
+        // when the app comes to the foreground (see MainActivity.onResume).
+        startBackgroundTimeoutInternal()
         WepWawetLogger.proxy("PairingService.onCreate")
+    }
+
+    /**
+     * v0.7.23: Start the background time limit timer. After BACKGROUND_TIMEOUT_MS
+     * (30 minutes), the service stops itself. Called in onCreate and whenever
+     * the app goes to the background (via MainActivity.onPause).
+     */
+    private fun startBackgroundTimeoutInternal() {
+        mainHandler.removeCallbacks(backgroundTimeoutRunnable)
+        mainHandler.postDelayed(backgroundTimeoutRunnable, BACKGROUND_TIMEOUT_MS)
+        WepWawetLogger.proxy("PairingService: background timeout started (30 min)")
+    }
+
+    /**
+     * v0.7.23: Cancel the background time limit timer. Called when the app
+     * comes to the foreground (via MainActivity.onResume).
+     */
+    private fun cancelBackgroundTimeoutInternal() {
+        mainHandler.removeCallbacks(backgroundTimeoutRunnable)
+        WepWawetLogger.proxy("PairingService: background timeout cancelled")
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // v0.7.23: The user swiped the app from recents — start the background
+        // timeout so the proxy doesn't run forever.
+        startBackgroundTimeoutInternal()
+        super.onTaskRemoved(rootIntent)
     }
 
     /**
@@ -545,6 +644,13 @@ class PairingService : Service() {
         WepWawetLogger.proxy("PairingService.onDestroy")
         // v0.7.21: Unregister the notification-deleted receiver.
         runCatching { unregisterReceiver(notificationDeletedReceiver) }
+        // v0.7.23: Remove all pending handler callbacks to prevent leaks
+        // (BUG PS-1: the repostNotificationRunnable + backgroundTimeoutRunnable).
+        mainHandler.removeCallbacks(repostNotificationRunnable)
+        mainHandler.removeCallbacks(backgroundTimeoutRunnable)
+        // v0.7.23: Clear the weak reference to this instance.
+        instance?.clear()
+        instance = null
         stopServers()
         super.onDestroy()
     }
