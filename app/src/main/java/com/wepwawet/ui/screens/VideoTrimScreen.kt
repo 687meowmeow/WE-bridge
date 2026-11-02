@@ -410,7 +410,7 @@ fun VideoTrimScreen(
                                                 onDragEnd = { },
                                             ) { _, dragAmount ->
                                                 if (durationMs <= 0) return@detectDragGestures
-                                                val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                                val deltaTime = (dragAmount / totalStripWidthPx * durationMs.toFloat()).toLong()
                                                 val newPos = (currentPosition + deltaTime)
                                                     .coerceIn(0L, durationMs)
                                                 player.seekTo(newPos)
@@ -449,7 +449,7 @@ fun VideoTrimScreen(
                                             onDragEnd = { player.seekTo(startMs) },
                                         ) { _, dragAmount ->
                                             if (durationMs <= 0) return@detectDragGestures
-                                            val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                            val deltaTime = (dragAmount / totalStripWidthPx * durationMs.toFloat()).toLong()
                                             // v0.7.23 BUG VT-1: guard against durationMs < 500
                                             // — coerceIn(min, max) throws if min > max.
                                             val maxStart = (endMs - 500).coerceAtLeast(0L)
@@ -488,7 +488,7 @@ fun VideoTrimScreen(
                                             onDragEnd = { player.seekTo(endMs) },
                                         ) { _, dragAmount ->
                                             if (durationMs <= 0) return@detectDragGestures
-                                            val deltaTime = (dragAmount / totalStripWidthPx * durationMs).toLong()
+                                            val deltaTime = (dragAmount / totalStripWidthPx * durationMs.toFloat()).toLong()
                                             // v0.7.23 BUG VT-1: guard against durationMs < 500
                                             val minEnd = (startMs + 500).coerceAtMost(durationMs)
                                                 .coerceAtLeast(0L)
