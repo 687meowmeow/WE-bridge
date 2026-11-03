@@ -737,7 +737,7 @@ class WorkshopDownloader(
             // Cleared in the finally block below. ===
             // v0.7.4: registered via the owner-checked setter so a previous
             // download's cleanup can't race-clear THIS download's callback.
-            JavaSteamLogBridge.setAbortCallback(this, workshopId) { reason ->
+            JavaSteamLogBridge.setAbortCallback(this@WorkshopDownloader, workshopId) { reason ->
                 if (downloadError == null) {
                     WepWawetLogger.proxyError("$TAG: abort triggered by JavaSteamLogBridge",
                         "reason" to reason.take(300))
@@ -905,7 +905,7 @@ class WorkshopDownloader(
             // memory leak + incorrect aborts on the next download).
             // v0.7.4: owner-checked — only clears if WE still own it (a newer
             // download may have already registered its own callback). ===
-            JavaSteamLogBridge.clearAbortCallback(this)
+            JavaSteamLogBridge.clearAbortCallback(this@WorkshopDownloader)
             WepWawetLogger.proxy("$TAG: cleared abort callback from JavaSteamLogBridge")
             WepWawetLogger.proxy("$TAG: downloader closed",
                 "files_done" to filesCompleted.get(),

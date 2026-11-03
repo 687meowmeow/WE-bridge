@@ -141,7 +141,10 @@ class CrashHandler private constructor(
             // output is only appended when the helper COMPLETED within the
             // budget; on timeout we write a marker and move on.
             val latch = java.util.concurrent.CountDownLatch(1)
-            @Volatile var helperOutput: String? = null
+            // @Volatile is not applicable to locals — the CountDownLatch's
+            // happens-before edge (await returns only after countDown, which
+            // follows the write) provides the needed visibility.
+            var helperOutput: String? = null
             kotlin.concurrent.thread(start = true, isDaemon = true) {
                 runCatching {
                     val helperSb = StringBuilder()

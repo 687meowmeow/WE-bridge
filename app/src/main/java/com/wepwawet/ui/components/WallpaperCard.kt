@@ -86,8 +86,12 @@ fun WallpaperCard(
     // map/list, so one progress tick from ANY download recomposed EVERY card
     // in the grid (30 cards x 10+ ticks/sec). The per-item derived flows only
     // emit when THIS item's entry changes.
-    val activeDownload by DownloadManager.activeDownloadFor(item.id).collectAsState()
-    val isCompleted by DownloadManager.isCompletedFor(item.id).collectAsState()
+    // v0.7.24 (H-U2 + smart-cast): collect into LOCAL vals — delegated
+    // State properties can't be smart-cast downstream.
+    val activeDownloadState = DownloadManager.activeDownloadFor(item.id).collectAsState()
+    val isCompletedState = DownloadManager.isCompletedFor(item.id).collectAsState()
+    val activeDownload = activeDownloadState.value
+    val isCompleted = isCompletedState.value
 
     val maturity = WorkshopTags.getMaturity(item.tags)
     val isMobile = WorkshopTags.isMobileCompatible(item.type)

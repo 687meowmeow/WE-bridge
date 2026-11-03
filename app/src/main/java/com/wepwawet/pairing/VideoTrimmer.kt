@@ -194,7 +194,7 @@ object VideoTrimmer {
                     WepWawetLogger.proxyWarn("$TAG: growing sample buffer for large sample",
                         "needed" to needed,
                         "current" to buffer.capacity())
-                    bigBuffer = ByteBuffer.allocate(needed)
+                    bigBuffer = ByteBuffer.allocate(needed.toInt())
                 }
                 val activeBuffer = if (needed > buffer.capacity()) bigBuffer ?: buffer else buffer
                 val sampleSize = extractor.readSampleData(activeBuffer, 0)

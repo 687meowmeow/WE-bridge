@@ -143,13 +143,6 @@ class WePairingServer {
     // live connections, new sockets are closed immediately.
     private val liveConnections = java.util.concurrent.atomic.AtomicInteger(0)
 
-    // v0.7.24 (H-P8): bounded connection acceptance. The old accept loop
-    // spawned an unbounded thread per incoming TCP connection — a scanner
-    // (or the WE app stuck in a reconnect loop) could spawn hundreds of
-    // threads each blocking on readFully. Beyond MAX_CONCURRENT_CONNECTIONS
-    // live connections, new sockets are closed immediately.
-    private val liveConnections = java.util.concurrent.atomic.AtomicInteger(0)
-
     // Callbacks
     var onPinRequested: (() -> String)? = null
     var onPairingSuccess: ((String) -> Unit)? = null  // deviceName

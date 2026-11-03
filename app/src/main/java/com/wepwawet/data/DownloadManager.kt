@@ -5,6 +5,7 @@ import com.google.gson.Gson
 import com.wepwawet.data.model.WorkshopItemTyped
 import com.wepwawet.log.WepWawetLogger
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -45,14 +46,22 @@ object DownloadManager {
 
     fun activeDownloadFor(itemId: String): StateFlow<DownloadProgress?> =
         activeItemFlows.computeIfAbsent(itemId) { id ->
-            kotlinx.coroutines.flow.combine(activeDownloads) { m -> m[id] }
-                .stateIn(com.wepwawet.WepWawetApplication.appScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), null)
+            // NOTE: extension-function syntax (flow.map { }), not top-level —
+            // Kotlin cannot call extensions as map(flow) {}.
+            activeDownloads.map { it[id] }
+                .stateIn(
+                    com.wepwawet.WepWawetApplication.appScope,
+                    kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+                    null)
         }
 
     fun isCompletedFor(itemId: String): StateFlow<Boolean> =
         completedItemFlows.computeIfAbsent(itemId) { id ->
-            kotlinx.coroutines.flow.combine(completedDownloads) { list -> list.any { it.itemId == id } }
-                .stateIn(com.wepwawet.WepWawetApplication.appScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), false)
+            completedDownloads.map { list -> list.any { it.itemId == id } }
+                .stateIn(
+                    com.wepwawet.WepWawetApplication.appScope,
+                    kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+                    false)
         }
 
     // ====== Completed downloads (history) ======

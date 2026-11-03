@@ -185,7 +185,7 @@ fun VideoTrimScreen(
                 // boxes — "frames not to the aspect ratio". Swap w/h for 90/270
                 // rotation so both the preview AND the frame boxes use the displayed
                 // (rotated) aspect ratio.
-                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ROTATION)?.toIntOrNull() ?: 0
+                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
                 val rotated = rotation == 90 || rotation == 270
                 val dispW = if (rotated) h else w
                 val dispH = if (rotated) w else h

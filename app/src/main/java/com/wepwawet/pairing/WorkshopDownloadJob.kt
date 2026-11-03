@@ -99,6 +99,12 @@ object WorkshopDownloadJob {
     // Job?` that serialized all downloads.
     private val jobs = ConcurrentHashMap<String, Job>()
 
+    /** v0.7.24 (H-D6): remove a completed job's own map entry (no-op if a
+     *  newer job already replaced it). Called from launchSafely's finally. */
+    private fun removeJobEntry(itemId: String, job: Job?) {
+        if (job != null) jobs.remove(itemId, job)
+    }
+
     // v0.7.20: Cached StateFlows for stateFor() — creating a new StateFlow
     // per recomposition would leak, so we cache one per item ID.
     private val stateFlows = ConcurrentHashMap<String, StateFlow<State>>()
@@ -1429,6 +1435,6 @@ private fun CoroutineScope.launchSafely(itemId: String, block: suspend Coroutine
             // unbounded leak of Job objects across a long session.
             // remove(key, value) semantics: if a NEW download for the same
             // item already replaced our entry, leave ITS entry alone.
-            WorkshopDownloadJob.jobs.remove(itemId, coroutineContext[kotlinx.coroutines.Job])
+            WorkshopDownloadJob.removeJobEntry(itemId, coroutineContext[kotlinx.coroutines.Job])
         }
     }

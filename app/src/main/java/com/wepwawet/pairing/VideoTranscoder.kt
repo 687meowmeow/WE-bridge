@@ -555,7 +555,13 @@ object VideoTranscoder {
                             val decodedImage = vDec.getOutputImage(pendingVideoDecoded)
                             val encoderImage = vEnc.getInputImage(encoderInputIndex)
                             if (decodedImage != null && encoderImage != null) {
-                                copyYuv420Image(decodedImage, encoderImage, width, height)
+                                // v0.7.24 (H-V7): read the encoder's slice
+                                // height so the tail rows get zeroed.
+                                val encSliceH = try {
+                                    vEnc.outputFormat.getInteger(
+                                        android.media.MediaFormat.KEY_SLICE_HEIGHT, -1)
+                                } catch (_: Exception) { -1 }
+                                copyYuv420Image(decodedImage, encoderImage, width, height, encSliceH)
                                 // Pass the encoder input buffer capacity as the
                                 // size — the full YUV420 frame per the encoder's
                                 // own layout (padding rows are zeroed by
@@ -893,6 +899,9 @@ object VideoTranscoder {
         dst: android.media.Image,
         width: Int,
         height: Int,
+        // v0.7.24 (H-V7): the encoder input format's KEY_SLICE_HEIGHT (or -1
+        // when absent) so zeroPlanePadding can zero the tail rows.
+        encSliceHeight: Int = -1,
     ) {
         val srcPlanes = src.planes
         val dstPlanes = dst.planes
@@ -908,9 +917,11 @@ object VideoTranscoder {
         // padding rows — leaving them uninitialized meant the encoder could
         // sample garbage (theoretical chroma artifacts). Zeroing is cheap (the
         // padding is usually zero-width for aligned resolutions).
-        zeroPlanePadding(dstPlanes[0], width, height)
-        zeroPlanePadding(dstPlanes[1], (width + 1) / 2, (height + 1) / 2)
-        zeroPlanePadding(dstPlanes[2], (width + 1) / 2, (height + 1) / 2)
+        // v0.7.24 (H-V7): chroma slice height is (sliceHeight+1)/2 for 4:2:0.
+        val chromaSlice = if (encSliceHeight > 0) (encSliceHeight + 1) / 2 else -1
+        zeroPlanePadding(dstPlanes[0], width, height, encSliceHeight)
+        zeroPlanePadding(dstPlanes[1], (width + 1) / 2, (height + 1) / 2, chromaSlice)
+        zeroPlanePadding(dstPlanes[2], (width + 1) / 2, (height + 1) / 2, chromaSlice)
     }
 
     /**
@@ -918,7 +929,15 @@ object VideoTranscoder {
      * between each row's visible pixels and the next row's start, plus the
      * tail after the last row).
      */
-    private fun zeroPlanePadding(plane: android.media.Image.Plane, width: Int, height: Int) {
+    private fun zeroPlanePadding(
+        plane: android.media.Image.Plane,
+        width: Int, height: Int,
+        // v0.7.24 (H-V7): Image.Plane has NO sliceHeight getter — it lives on
+        // the encoder's input FORMAT (KEY_SLICE_HEIGHT), so the caller passes
+        // it in. Default -1 = "unknown, skip the tail-zero pass" (previous
+        // behavior).
+        sliceHeight: Int = -1,
+    ) {
         val rowStride = plane.rowStride
         val pixelStride = plane.pixelStride
         val buffer = plane.buffer
@@ -941,9 +960,8 @@ object VideoTranscoder {
         // uninitialized native heap there → intermittent green/garbage band
         // at the bottom of the encoded frame. Zero every byte from the end
         // of the visible rows to the end of the plane's slice.
-        // plane.rowStride * sliceHeight is the plane's nominal extent (for
+        // rowStride * sliceHeight is the plane's nominal extent (for
         // interleaved chroma, sliceHeight already covers the shared buffer).
-        val sliceHeight = plane.sliceHeight
         if (sliceHeight > height) {
             var pos = height * rowStride
             val end = minOf(sliceHeight * rowStride, capacity)
