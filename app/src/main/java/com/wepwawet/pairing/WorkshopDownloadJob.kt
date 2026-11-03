@@ -112,8 +112,16 @@ object WorkshopDownloadJob {
     fun stateFor(itemId: String): StateFlow<State> =
         stateFlows.computeIfAbsent(itemId) { id ->
             _states
+                // v0.7.24 (H-D7 BUG FIX): was SharingStarted.Eagerly — every
+                // item whose detail screen was ever opened kept a
+                // permanently-active upstream coroutine on appScope forever
+                // (browsing 500 wallpapers = 500 leaked coroutines + flows).
+                // WhileSubscribed stops the upstream when no UI collects it
+                // (with a 5s grace window across recompositions), while the
+                // cached StateFlow itself still replays the last value to any
+                // new collector instantly.
                 .map { it[id] ?: State() }
-                .stateIn(WepWawetApplication.appScope, SharingStarted.Eagerly, State())
+                .stateIn(WepWawetApplication.appScope, SharingStarted.WhileSubscribed(5000), State())
         }
 
     /**
@@ -130,17 +138,28 @@ object WorkshopDownloadJob {
     }
 
     /**
-     * v0.7.20: Update a specific item's state. Also mirrors the update to
-     * the legacy [_state] for backwards-compat callers that still read
-     * `WorkshopDownloadJob.state`.
+     * v0.7.20: Update a specific item's state.
+     *
+     * v0.7.24 (H-D9): the legacy `_state` mirror previously wrote the
+     * calling item's state on EVERY update — with concurrent downloads, two
+     * items alternated overwriting it, so any remaining `state` collector
+     * saw the progress flicker between items. The mirror is now only
+     * maintained for single-download sessions (exactly one item with a job
+     * in the map); when multiple downloads are in flight the mirror is
+     * cleared to the neutral State rather than flickering. All real
+     * consumers were migrated to [stateFor] in v0.7.20-v0.7.23; the mirror
+     * exists only for compatibility.
      */
     private fun updateState(itemId: String, update: (State) -> State) {
         _states.update { current ->
             val existing = current[itemId] ?: State(workshopId = itemId)
             current + (itemId to update(existing))
         }
-        // Mirror to legacy single-state for any code that still reads _state
-        _state.value = _states.value[itemId] ?: State()
+        val running = jobs.count { it.value.isActive }
+        _state.value = when {
+            running <= 1 -> _states.value[itemId] ?: State()
+            else -> State()
+        }
     }
 
     // === v0.5.9-alpha (R8 fix): mirror state into DownloadManager so the
@@ -411,7 +430,12 @@ object WorkshopDownloadJob {
             // sleeping. ETC2 encoding is CPU-intensive and can take minutes
             // for large textures — without a wake lock, the device may throttle
             // or sleep mid-pack, drastically increasing pack time.
-            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            // v0.7.24 (M-D15): appContext (not `context`) — the parameter can
+            // be an Activity; holding its getSystemService result is fine here
+            // (POWER_SERVICE returns a system singleton) but the pattern was
+            // inconsistent with the other two call sites and risks holding an
+            // Activity reference in a coroutine that outlives it.
+            val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
             val wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WepWawet:MpkgPacker")
             wakeLock.setReferenceCounted(false)
             wakeLock.acquire(10 * 60 * 1000L) // 10 minute timeout
@@ -1308,11 +1332,13 @@ object WorkshopDownloadJob {
         stateFlows.remove(itemId)
     }
 
+    // v0.7.24 (M-D2/L-D1): Locale.US + shared with WorkshopDownloader's
+    // identical (removed-duplicate) copy.
     private fun formatBytes(bytes: Long): String = when {
         bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
-        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
-        else -> "%.2f GB".format(bytes / (1024.0 * 1024 * 1024))
+        bytes < 1024 * 1024 -> String.format(java.util.Locale.US, "%.1f KB", bytes / 1024.0)
+        bytes < 1024 * 1024 * 1024 -> String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024))
+        else -> String.format(java.util.Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024))
     }
 }
 
@@ -1395,5 +1421,14 @@ private fun CoroutineScope.launchSafely(itemId: String, block: suspend Coroutine
             throw e
         } catch (e: Throwable) {
             WorkshopDownloadJob.markCrashed(itemId, "Crashed: ${e.message ?: e.javaClass.name}")
+        } finally {
+            // v0.7.24 (H-D6): remove the entry when the job completes (success,
+            // failure, or crash). Dead Job references previously lingered in
+            // the map forever (cancel() removed its own entry, but normal
+            // completion never did) — harmless for isActive checks, but an
+            // unbounded leak of Job objects across a long session.
+            // remove(key, value) semantics: if a NEW download for the same
+            // item already replaced our entry, leave ITS entry alone.
+            WorkshopDownloadJob.jobs.remove(itemId, coroutineContext[kotlinx.coroutines.Job])
         }
     }

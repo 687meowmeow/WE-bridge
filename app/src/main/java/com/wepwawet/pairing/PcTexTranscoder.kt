@@ -276,7 +276,10 @@ object PcTexTranscoder {
         etc2Encoder: ((ByteArray, Int, Int) -> ByteArray?)?,
     ): ByteArray? {
         if (w <= 0 || h <= 0) return null
-        if (rgba.size < w * h * 4) return null
+        // v0.7.24 (H-S7 BUG FIX): `w * h * 4` is 32-bit Int math — for huge
+        // inputs (≥ 2^29 px) it overflows NEGATIVE, making the check PASS on
+        // exactly the inputs that then corrupt the header. 64-bit comparison.
+        if (rgba.size.toLong() < w.toLong() * h.toLong() * 4L) return null
 
         val useEtc2 = shouldUseEtc2(sourceFormat, force)
         if (useEtc2 && etc2Encoder != null) {

@@ -4,7 +4,7 @@
 
 **Status: v0.7.x-alpha — functional alpha.** Browse → login → download works end-to-end on-device. A pairing proxy is included for the official Wallpaper Engine Android app.
 
-[![Build APK](https://github.com/687meowmeow/WE-backend/actions/workflows/build.yml/badge.svg)](https://github.com/687meowmeow/WE-backend/actions/workflows/build.yml)
+[![Build APK](https://github.com/687meowmeow/WE-bridge/actions/workflows/build.yml/badge.svg)](https://github.com/687meowmeow/WE-bridge/actions/workflows/build.yml)
 
 ---
 

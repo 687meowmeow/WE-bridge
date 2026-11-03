@@ -362,8 +362,28 @@ class PairingService : Service() {
         // v0.7.23: Store a weak reference to this instance so the static
         // startBackgroundTimeout/cancelBackgroundTimeout methods can access it.
         instance = java.lang.ref.WeakReference(this)
-        // v0.7.23: Start the background time limit. The timer is cancelled
-        // when the app comes to the foreground (see MainActivity.onResume).
+        // v0.7.24 (H-P3 + H-A6 BUG FIX): the 30-minute background timeout is
+        // now driven by the PROCESS lifecycle (ProcessLifecycleOwner), not by
+        // MainActivity.onPause/onResume. The Activity callbacks fired on every
+        // in-app navigation (e.g. to SteamLoginActivity), and when the service
+        // was created while the app was ALREADY resumed, onResume never fired
+        // again — so the timer was never cancelled and the proxy killed
+        // itself 30 minutes into active use. ON_STOP only fires when the
+        // WHOLE process goes to the background; ON_START cancels the timer no
+        // matter which Activity resumed.
+        androidx.lifecycle.ProcessLifecycleOwner.get().lifecycle.addObserver(
+            object : androidx.lifecycle.DefaultLifecycleObserver {
+                override fun onStop(owner: androidx.lifecycle.LifecycleOwner) {
+                    startBackgroundTimeoutInternal()
+                }
+                override fun onStart(owner: androidx.lifecycle.LifecycleOwner) {
+                    cancelBackgroundTimeoutInternal()
+                }
+            }
+        )
+        // Arm the timer defensively at create; the process-lifecycle observer
+        // cancels it on the next ON_START if we're actually in the foreground
+        // (ProcessLifecycleOwner replays the current state to new observers).
         startBackgroundTimeoutInternal()
         WepWawetLogger.proxy("PairingService.onCreate")
     }
@@ -418,6 +438,10 @@ class PairingService : Service() {
         WepWawetLogger.proxyWarn("PairingService.onTimeout — system requested stop (specialUse should not time out)",
             "start_id" to startId,
             "action" to "graceful_stop")
+        // v0.7.24 (M-P8): on Android 15 (API 35+, our targetSdk) the system
+        // calls the TWO-ARG overload onTimeout(startId, fgsType) — the
+        // one-arg override below it is only invoked on Android 14. Both
+        // funnel into the same graceful stop.
         // Stop the pairing servers cleanly so pairedDeviceName is cleared
         stopServers()
         // Remove the foreground notification
@@ -425,6 +449,20 @@ class PairingService : Service() {
         // Stop the service — the proxy will resume on next PairingService.start()
         // call (either from MainActivity.onCreate auto-start, BootReceiver, or
         // the user returning to the Pairing screen).
+        stopSelf()
+    }
+
+    /**
+     * v0.7.24 (M-P8): Android 15 (API 35) invokes this two-arg overload
+     * instead of onTimeout(Int). Delegates to the same graceful stop.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        WepWawetLogger.proxyWarn("PairingService.onTimeout(2-arg, Android 15+) — system requested stop",
+            "start_id" to startId,
+            "fgs_type" to fgsType,
+            "action" to "graceful_stop")
+        stopServers()
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         stopSelf()
     }
 
@@ -455,7 +493,12 @@ class PairingService : Service() {
                 "had_broadcaster" to (discoveryBroadcaster != null),
                 "was_paired" to (pairedDeviceName != null))
             stopServers()
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            // v0.7.24 (H-P2): if the system restarted us via START_STICKY and
+            // the first delivered intent carries ACTION_KILL, we reach here
+            // WITHOUT ever having called startForeground() — calling
+            // stopForeground() then throws. Wrapped; the stopSelf() below is
+            // what actually matters in that path.
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             stopSelf()
             return START_NOT_STICKY
         }
@@ -463,7 +506,9 @@ class PairingService : Service() {
         // Get PIN from intent (default "1234" matches the auto-start PIN
         // used by MainActivity.onCreate and the PairingScreen default).
         val pin = intent?.getStringExtra(EXTRA_PIN) ?: getPairingPin(this)
-        WepWawetLogger.proxy("Starting pairing servers", "pin" to pin)
+        // v0.7.24 (C-P3): PIN redacted from logs.
+        WepWawetLogger.proxy("Starting pairing servers",
+            "pin" to if (pin == "1234") "default" else "custom(${pin.length})")
 
         // v0.7.1 (round 6 — pairing persistence): SMART RESTART.
         //
@@ -487,7 +532,7 @@ class PairingService : Service() {
         if (existingServer != null && existingServer.isRunning && runningPin == pin) {
             // Server is alive + PIN unchanged — don't kill the phone session.
             WepWawetLogger.proxy("PairingService: server already running with same PIN — keeping live session",
-                "pin" to pin,
+                "pin" to if (pin == "1234") "default" else "custom(${pin.length})",
                 "broadcaster_alive" to (existingBroadcaster?.isRunning ?: false))
 
             // v0.7.1 (round 6): notification text should show "Paired: <name>"
@@ -562,12 +607,23 @@ class PairingService : Service() {
             // ForegroundServiceStartNotAllowedException on Android 12+ when
             // the service is started from the background (e.g. from
             // BootReceiver just after a reboot, before the user opens
-            // the app). We log instead of crashing.
+            // the app).
+            //
+            // v0.7.24 (H-P1 BUG FIX): was `return START_STICKY`. The 5-second
+            // startForeground deadline had ALREADY been missed at this point,
+            // so on Android 12+ the system throws
+            // ForegroundServiceDidNotStartInTimeException and kills the
+            // process; START_STICKY then re-delivers the SAME intent,
+            // re-entering onStartCommand, re-throwing — a tight restart loop
+            // that could pin the CPU. Stop cleanly instead; the proxy comes
+            // back on the next user-initiated start (app open / Pairing
+            // screen / boot).
             val excName = e.javaClass.name
-            WepWawetLogger.proxyError("startForeground failed — service start deferred until app foreground",
+            WepWawetLogger.proxyError("startForeground failed — stopping service (will restart on next user action)",
                 "exception" to excName,
                 "message" to (e.message ?: ""))
-            return START_STICKY
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
 
         // Stop any existing servers (PIN changed or first start)

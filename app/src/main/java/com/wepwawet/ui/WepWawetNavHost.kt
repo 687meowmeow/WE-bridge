@@ -96,8 +96,14 @@ fun WepWawetNavHost() {
     // during navigation. By hoisting to the NavHost level (which never leaves
     // composition), the gridState object persists across the entire app
     // session.
-    val workshopGridState = remember { LazyGridState() }
-    val creatorGridState = remember { LazyGridState() }
+    // v0.7.24 (H-U3): rememberSaveable + LazyGridState.Saver — plain remember
+    // lost the scroll position on every configuration change (rotation,
+    // dark-mode toggle, locale change) because the whole Activity including
+    // the NavHost is recreated.
+    val workshopGridState = androidx.compose.runtime.saveable.rememberSaveable(
+        saver = LazyGridState.Saver) { LazyGridState() }
+    val creatorGridState = androidx.compose.runtime.saveable.rememberSaveable(
+        saver = LazyGridState.Saver) { LazyGridState() }
 
     // Reload the Steam Web API key every time the user returns to the NavHost
     // (e.g. after saving a new key in Settings). Uses a lifecycle observer so
@@ -142,8 +148,12 @@ fun WepWawetNavHost() {
             arguments = listOf(navArgument("steamId") { type = NavType.StringType }),
         ) { entry ->
             val steamId = entry.arguments?.getString("steamId").orEmpty()
-            WepWawetLogger.lifecycle("NavHost navigate to creator",
-                "steam_id" to steamId)
+            // v0.7.24 (H-U4): logged from a LaunchedEffect — logging
+            // directly in the composable body fired on every recomposition.
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                WepWawetLogger.lifecycle("NavHost navigate to creator",
+                    "steam_id" to steamId)
+            }
             WorkshopBrowserScreen(
                 onItemClick = { id -> nav.navigate("detail/$id") },
                 onOpenDownloads = { nav.navigate("downloads") },
@@ -159,7 +169,11 @@ fun WepWawetNavHost() {
         }
 
         composable("downloads") {
-            WepWawetLogger.lifecycle("NavHost navigate to downloads")
+            // v0.7.24 (H-U4): logged from a LaunchedEffect — logging
+            // directly in the composable body fired on every recomposition.
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                WepWawetLogger.lifecycle("NavHost navigate to downloads")
+            }
             DownloadManagerScreen(
                 onBack = { nav.popBackStack() },
                 onItemClick = { itemId -> nav.navigate("detail/$itemId") },
@@ -171,8 +185,12 @@ fun WepWawetNavHost() {
             arguments = listOf(navArgument("itemId") { type = NavType.StringType }),
         ) { entry ->
             val itemId = entry.arguments?.getString("itemId").orEmpty()
-            WepWawetLogger.lifecycle("NavHost navigate to detail",
-                "item_id" to itemId)
+            // v0.7.24 (H-U4): logged from a LaunchedEffect — logging
+            // directly in the composable body fired on every recomposition.
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                WepWawetLogger.lifecycle("NavHost navigate to detail",
+                    "item_id" to itemId)
+            }
             WallpaperDetailScreen(
                 itemId = itemId,
                 onBack = { nav.popBackStack() },
@@ -216,7 +234,11 @@ fun WepWawetNavHost() {
         // SharedPreferences file under the `saved_creators` StringSet (see
         // WallpaperDetailScreen's favorite-heart toggle).
         composable("favorites") {
-            WepWawetLogger.lifecycle("NavHost navigate to favorites")
+            // v0.7.24 (H-U4): logged from a LaunchedEffect — logging
+            // directly in the composable body fired on every recomposition.
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                WepWawetLogger.lifecycle("NavHost navigate to favorites")
+            }
             FavoritesScreen(
                 onBack = { nav.popBackStack() },
                 onCreatorClick = { steamId -> nav.navigate("creator/$steamId") },
@@ -236,17 +258,26 @@ fun WepWawetNavHost() {
             ),
         ) { entry ->
             val trimItemId = entry.arguments?.getString("itemId").orEmpty()
-            val trimItemTitle = java.net.URLDecoder.decode(
-                entry.arguments?.getString("itemTitle").orEmpty(), "UTF-8")
+            // v0.7.24 (H-U5 BUG FIX): URLDecoder.decode THROWS
+            // IllegalArgumentException on a malformed % sequence — called
+            // during composition, it crashed the app straight out of the
+            // NavHost. Fall back to the raw string on failure.
+            val trimItemTitle = runCatching {
+                java.net.URLDecoder.decode(
+                    entry.arguments?.getString("itemTitle").orEmpty(), "UTF-8")
+            }.getOrElse { entry.arguments?.getString("itemTitle").orEmpty() }
             // v0.7.20: Read the video file path from the per-item state (was
             // WorkshopDownloadJob.state.value.pendingVideoFile which under
             // concurrent downloads could read the wrong item's pending video).
             val trimVideoPath = com.wepwawet.pairing.WorkshopDownloadJob
                 .pendingVideoFor(trimItemId)?.first
-            WepWawetLogger.lifecycle("NavHost navigate to videoTrim",
-                "item_id" to trimItemId,
-                "video_path" to (trimVideoPath ?: "null"),
-                "item_title" to trimItemTitle)
+            // v0.7.24 (H-U4): logged from a LaunchedEffect (see above).
+            androidx.compose.runtime.LaunchedEffect(trimItemId) {
+                WepWawetLogger.lifecycle("NavHost navigate to videoTrim",
+                    "item_id" to trimItemId,
+                    "video_path" to (trimVideoPath ?: "null"),
+                    "item_title" to trimItemTitle)
+            }
             // v0.7.21 BUG FIX: If pendingVideoFor returns null (e.g. the
             // pending state was cleared by a concurrent cancelVideoSend, or
             // the user deep-linked to this route without a pending video),

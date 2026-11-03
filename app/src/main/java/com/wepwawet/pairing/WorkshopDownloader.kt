@@ -60,34 +60,52 @@ import `in`.dragonbra.javasteam.util.log.LogManager
 private object JavaSteamLogBridge : LogListener {
     private val installed = AtomicBoolean(false)
     /**
-     * Set by the active WorkshopDownloader instance so the bridge can
-     * abort its download when a known library bug is detected.
-     * Single-threaded download assumption — only one active download at a time.
-     *
-     * v0.7.4: set/clear now go through [setAbortCallback]/[clearAbortCallback]
-     * with an owner check. Previously a download's cleanup (`abortCallback = null`)
-     * could race a NEW download's registration if the old coroutine was still
-     * unwinding while the new one connected (e.g. cancel + immediate retry) —
-     * silently disabling library-bug detection for the new download.
+     * v0.7.24 (C-D1 BUG FIX): the bridge held ONE callback — a single global.
+     * v0.7.20 added CONCURRENT downloads (each item gets its own
+     * WorkshopDownloader), so download B's registration overwrote download
+     * A's: a library error for A then set B's downloadError while A hung for
+     * the full 60s stuck-detection timeout. Callbacks are now keyed by owner
+     * (one per in-flight downloader) and library errors are dispatched to the
+     * owner whose workshopId matches the "Published file <id>" in the message;
+     * when no id can be parsed, every registered owner is notified (each
+     * downloader's callback only acts if downloadError is still null).
      */
-    @Volatile var abortCallback: ((String) -> Unit)? = null
-    @Volatile private var abortOwner: Any? = null
-    private val abortLock = Any()
+    private val abortCallbacks = java.util.concurrent.ConcurrentHashMap<WorkshopDownloader, (String) -> Unit>()
 
-    fun setAbortCallback(owner: Any, callback: ((String) -> Unit)?) {
-        synchronized(abortLock) {
-            abortOwner = if (callback != null) owner else null
-            abortCallback = callback
+    /** The workshopId currently being downloaded by each owner (for dispatch). */
+    private val ownerWorkshopIds = java.util.concurrent.ConcurrentHashMap<WorkshopDownloader, String>()
+
+    fun setAbortCallback(owner: WorkshopDownloader, workshopId: String, callback: ((String) -> Unit)?) {
+        if (callback != null) {
+            abortCallbacks[owner] = callback
+            ownerWorkshopIds[owner] = workshopId
+        } else {
+            abortCallbacks.remove(owner)
+            ownerWorkshopIds.remove(owner)
         }
     }
 
-    fun clearAbortCallback(owner: Any) {
-        synchronized(abortLock) {
-            if (abortOwner === owner) {
-                abortOwner = null
-                abortCallback = null
+    fun clearAbortCallback(owner: WorkshopDownloader) {
+        abortCallbacks.remove(owner)
+        ownerWorkshopIds.remove(owner)
+    }
+
+    /** v0.7.24 (C-D1): dispatch a library error to the matching owner(s). */
+    private fun dispatchAbort(reason: String, rawMessage: String) {
+        val fileId = Regex("""Published file (\d+)""").find(rawMessage)?.groupValues?.get(1)
+        if (fileId != null) {
+            var dispatched = false
+            for ((owner, callback) in abortCallbacks) {
+                if (ownerWorkshopIds[owner] == fileId) {
+                    callback(reason)
+                    dispatched = true
+                }
             }
+            if (dispatched) return
         }
+        // No id in the message (or no match): notify every owner — each
+        // callback no-ops unless its downloadError is still null.
+        abortCallbacks.values.forEach { it(reason) }
     }
 
     fun installIfNeeded() {
@@ -132,7 +150,7 @@ private object JavaSteamLogBridge : LogListener {
             }
             WepWawetLogger.proxyError("JavaSteamLogBridge: detected library skip — aborting download",
                 "reason" to reason.take(300))
-            abortCallback?.invoke(reason)
+            dispatchAbort(reason, msg)
         }
         // BUG 2: "Unable to locate manifest ID for published file X"
         //   - Library logs this when the workshop item's fileUrl is empty AND
@@ -146,7 +164,7 @@ private object JavaSteamLogBridge : LogListener {
                 "Library log: $msg"
             WepWawetLogger.proxyError("JavaSteamLogBridge: detected no-download-source — aborting download",
                 "reason" to reason.take(300))
-            abortCallback?.invoke(reason)
+            dispatchAbort(reason, msg)
         }
     }
 }
@@ -719,7 +737,7 @@ class WorkshopDownloader(
             // Cleared in the finally block below. ===
             // v0.7.4: registered via the owner-checked setter so a previous
             // download's cleanup can't race-clear THIS download's callback.
-            JavaSteamLogBridge.setAbortCallback(this) { reason ->
+            JavaSteamLogBridge.setAbortCallback(this, workshopId) { reason ->
                 if (downloadError == null) {
                     WepWawetLogger.proxyError("$TAG: abort triggered by JavaSteamLogBridge",
                         "reason" to reason.take(300))
@@ -735,7 +753,11 @@ class WorkshopDownloader(
             // started..." for hours with no further updates.
             val completionTimeoutMs = 10L * 60 * 1000  // 10 minutes
             val completionStart = System.currentTimeMillis()
-            var completionException: Exception? = null
+            // v0.7.24 (H-D2 BUG FIX): a `var` captured by the inner Thread
+            // lambda is boxed in a Ref object WITHOUT volatile semantics —
+            // the waiting thread could observe a stale null forever. Atomic
+            // reference gives a safe happens-before edge.
+            val completionException = java.util.concurrent.atomic.AtomicReference<Exception?>(null)
             WepWawetLogger.proxy("$TAG: calling awaitCompletion (with ${completionTimeoutMs / 1000}s timeout)",
                 "thread" to Thread.currentThread().name,
                 "downloader_class" to downloader.javaClass.name)
@@ -752,7 +774,7 @@ class WorkshopDownloader(
                             "thread" to Thread.currentThread().name,
                             "exception" to e.javaClass.name,
                             "message" to (e.message ?: ""))
-                        completionException = e
+                        completionException.set(e)
                     }
                 }.apply { isDaemon = true; name = "JavaSteam-DepotCompletion"; start() }
 
@@ -772,7 +794,21 @@ class WorkshopDownloader(
                             "error" to (downloadError?.message ?: ""))
                         break
                     }
-                    try { Thread.sleep(500) } catch (_: InterruptedException) { waitInterrupted = true; break }
+                    // v0.7.24 (C-D3 BUG FIX): was `Thread.sleep(500)` — NOT a
+                    // suspension point, so cancelling the parent coroutine
+                    // (user taps Cancel / navigates away) never took effect:
+                    // the loop kept polling for up to the full 10-minute
+                    // timeout while the Steam client kept streaming chunks.
+                    // delay(500) suspends and throws CancellationException the
+                    // moment the job is cancelled — we break out, interrupt
+                    // the completion thread, and the finally block cleans up
+                    // the Steam connection within ~0.5s of the tap.
+                    try {
+                        kotlinx.coroutines.delay(500)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        waitInterrupted = true
+                        break
+                    }
                 }
                 when {
                     // Real error already set (abort callback / watchdog / stuck
@@ -787,7 +823,11 @@ class WorkshopDownloader(
                     // bogus timeout, and restore the interrupt status for the
                     // caller's blocking-cancellation handling.
                     waitInterrupted -> {
-                        Thread.currentThread().interrupt()
+                        // v0.7.24 (C-D3): no Thread.currentThread().interrupt() —
+                        // with delay()-based cancellation there is no interrupt to
+                        // restore, and setting the flag on a pooled Dispatchers.IO
+                        // thread would spuriously interrupt the NEXT coroutine
+                        // that reuses it.
                         completionJob.interrupt()
                         downloadError = java.lang.Exception("Download wait interrupted — cancelled")
                     }
@@ -805,12 +845,13 @@ class WorkshopDownloader(
                         completionJob.interrupt()
                         downloadError = java.lang.Exception("Download timed out after ${elapsedSec}s — Steam CDN may be slow or stuck. Last status: $statusAtTimeout")
                     }
-                    completionException != null -> {
+                    completionException.get() != null -> {
+                        val ce = completionException.get()
                         WepWawetLogger.proxyWarn("$TAG: awaitCompletion threw",
-                            "exception" to (completionException?.javaClass?.name ?: ""),
-                            "message" to (completionException?.message ?: ""))
-                        if (downloadError == null) {
-                            downloadError = completionException
+                            "exception" to (ce?.javaClass?.name ?: ""),
+                            "message" to (ce?.message ?: ""))
+                        if (downloadError == null && ce != null) {
+                            downloadError = ce
                         }
                     }
                     else -> {
@@ -935,6 +976,17 @@ class WorkshopDownloader(
                     return@withContext null
                 }
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // v0.7.24 (C-D4 BUG FIX): CancellationException extends
+            // IllegalStateException extends Exception — the old
+            // `catch (e: Exception)` swallowed the cancellation and converted
+            // it to a normal `null` return, after which the caller kept doing
+            // real work (packing, queueing) against a cancelled scope.
+            // Re-throw so structured concurrency completes; the finally block
+            // below still disconnects Steam.
+            WepWawetLogger.proxyWarn("$TAG: download cancelled",
+                "exception" to e.javaClass.name)
+            throw e
         } catch (e: Exception) {
             WepWawetLogger.proxyError("$TAG: exception", "exception" to e.javaClass.name, "message" to (e.message ?: ""))
             onStatusUpdate("Error: ${e.message}")
@@ -973,6 +1025,20 @@ class WorkshopDownloader(
             (httpClient?.dispatcher?.executorService as? java.util.concurrent.ExecutorService)
                 ?.shutdownNow()
         }
+        // v0.7.24 (C-D2 BUG FIX): the disconnect above aborts the OLD
+        // session's authPollingThread's in-flight pollingWaitForResult()
+        // future — but the thread itself was only ever interrupted in
+        // cleanup(), NEVER on reconnect. The orphaned thread then received
+        // the disconnect exception, saw isRetrying == false, and wrote
+        // `downloadError = e` AFTER this function had just cleared it —
+        // clobbering the NEW session's state (connectAndAuthenticate then
+        // failed spuriously). Interrupt + JOIN the old thread here so it is
+        // fully dead before the state reset below.
+        authPollingThread?.let { oldThread ->
+            try { oldThread.interrupt() } catch (_: Exception) {}
+            try { oldThread.join(2000) } catch (_: Exception) {}
+        }
+        authPollingThread = null
 
         // === Reset auth state from any previous session ===
         // CRITICAL: If this WorkshopDownloader instance is being REUSED (e.g.,
@@ -1138,6 +1204,12 @@ class WorkshopDownloader(
      */
     fun cleanup() {
         try { steamUser?.logOff() } catch (_: Exception) {}
+        // v0.7.24 (M-D8): logOff() is asynchronous — disconnecting in the
+        // same microsecond could cut the logoff message mid-flight, leaving
+        // a ghost session on Steam's side (the CM keeps the session alive
+        // until its own timeout, contributing to RateLimitExceeded). A short
+        // grace delay lets the message hit the wire.
+        try { Thread.sleep(150) } catch (_: InterruptedException) {}
         try { steamClient?.disconnect() } catch (_: Exception) {}
         // v0.7.4: interrupt the modern-auth polling thread — it may still be
         // blocked in pollingWaitForResult().get() waiting for the user to
@@ -1186,7 +1258,7 @@ class WorkshopDownloader(
         isRetrying = false  // clear retry flag on new connection
 
         // Step 1: Try saved refresh token first (no 2FA needed)
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val prefs = SteamCredentialsStore.tokenPrefs(context)
         val savedToken = prefs.getString(KEY_REFRESH_TOKEN, null)
         val savedAccountName = prefs.getString(KEY_ACCOUNT_NAME, null)
         WepWawetLogger.proxy("$TAG: checking for saved refresh token",
@@ -1268,7 +1340,7 @@ class WorkshopDownloader(
 
                     // Save refresh token + account name for future logins (survives app updates)
                     if (!result.refreshToken.isNullOrBlank()) {
-                        context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                        SteamCredentialsStore.tokenPrefs(context)
                             .edit()
                             .putString(KEY_REFRESH_TOKEN, result.refreshToken)
                             .putString(KEY_ACCOUNT_NAME, result.accountName)
@@ -1366,7 +1438,7 @@ class WorkshopDownloader(
                 usedRefreshToken = false
                 authInProgress = false
                 // Clear the stale refresh token so the next attempt uses modern auth
-                appContext?.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                appContext?.let { SteamCredentialsStore.tokenPrefs(it) }
                     ?.edit()?.remove(KEY_REFRESH_TOKEN)?.remove(KEY_ACCOUNT_NAME)?.apply()
                 WepWawetLogger.proxy("$TAG: stale refresh token cleared (was rejected with ${callback.result})")
                 // Set a user-friendly error and let the caller handle it.
@@ -1380,7 +1452,7 @@ class WorkshopDownloader(
             }
             // Clear stale token on RateLimitExceeded
             if (callback.result == EResult.RateLimitExceeded) {
-                appContext?.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                appContext?.let { SteamCredentialsStore.tokenPrefs(it) }
                     ?.edit()?.remove(KEY_REFRESH_TOKEN)?.remove(KEY_ACCOUNT_NAME)?.apply()
             }
             // Provide user-friendly error messages
@@ -1630,10 +1702,13 @@ class WorkshopDownloader(
         }
     }
 
+    // v0.7.24 (M-D2): Locale.US — String.format with the default locale
+    // renders Arabic-Indic digits (٣٫٥) in ar/fa locales, breaking the log
+    // parsers AND the status strings shown to the user.
     private fun formatBytes(bytes: Long): String = when {
         bytes < 1024 -> "$bytes B"
-        bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024.0)
-        bytes < 1024 * 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024))
-        else -> "%.2f GB".format(bytes / (1024.0 * 1024 * 1024))
+        bytes < 1024 * 1024 -> String.format(java.util.Locale.US, "%.1f KB", bytes / 1024.0)
+        bytes < 1024 * 1024 * 1024 -> String.format(java.util.Locale.US, "%.1f MB", bytes / (1024.0 * 1024))
+        else -> String.format(java.util.Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024))
     }
 }

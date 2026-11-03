@@ -150,7 +150,7 @@ object PcShaderFixes {
     private const val FOR_FLOAT_SAMPLECOUNT_SUFFIX = " = 0.0; i < sampleCount;"
 
     /** Exact PC int→float regex — note the character class has NO ',', ':' or '='. */
-    private val INT_TO_FLOAT = Regex("""([\s\(/\)\+\-\*\%\\/\]])(\d+)(?!\.)(\b)""")
+    private val INT_TO_FLOAT = Regex("""([\s\(/\)\+\-\*\%\\\]])(\d+)(?!\.)(\b)""")
     private val SCI_NOTATION = Regex("""([\d\.]e[-]*[\d]+)\.0""")
     private val SAMPLE_KEYWORD = Regex("""(\b)(sample)(\b)""")
     private val CONST_INTC_SAMPLECOUNT = Regex("""(\s*const )int( sampleCount)""")

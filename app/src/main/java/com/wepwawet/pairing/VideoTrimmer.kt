@@ -155,6 +155,8 @@ object VideoTrimmer {
             // Copy samples within [snapUs, cappedEnd]. PTS is re-based by snapUs
             // so the output timeline starts at ~0 (v0.7.4 fix 2).
             val buffer = ByteBuffer.allocate(1024 * 1024) // 1MB buffer
+            // v0.7.24 (H-V8): lazily grown for samples larger than 1MB.
+            var bigBuffer: ByteBuffer? = null
             val bufferInfo = android.media.MediaCodec.BufferInfo()
             var samplesCopied = 0
             var bytesCopied = 0L
@@ -180,7 +182,22 @@ object VideoTrimmer {
                     continue
                 }
 
-                val sampleSize = extractor.readSampleData(buffer, 0)
+                // v0.7.24 (H-V8 BUG FIX): readSampleData returns
+                // min(sampleSize, buffer.capacity()) — it does NOT error on
+                // truncation. The fixed 1MB buffer silently clipped any larger
+                // sample (4K H.264 keyframes are routinely 10-20MB), shipping
+                // a truncated IDR → decode errors and seek crashes. Grow the
+                // buffer when the real sample is bigger (capped at 64MB as a
+                // sanity ceiling).
+                val needed = extractor.sampleSize
+                if (needed > buffer.capacity() && needed <= 64 * 1024 * 1024) {
+                    WepWawetLogger.proxyWarn("$TAG: growing sample buffer for large sample",
+                        "needed" to needed,
+                        "current" to buffer.capacity())
+                    bigBuffer = ByteBuffer.allocate(needed)
+                }
+                val activeBuffer = if (needed > buffer.capacity()) bigBuffer ?: buffer else buffer
+                val sampleSize = extractor.readSampleData(activeBuffer, 0)
                 if (sampleSize < 0) break
 
                 if (firstSampleUs < 0) firstSampleUs = sampleTime
@@ -194,7 +211,7 @@ object VideoTrimmer {
                     else -> 0
                 }
 
-                muxer.writeSampleData(muxerTrackIndex, buffer, bufferInfo)
+                muxer.writeSampleData(muxerTrackIndex, activeBuffer, bufferInfo)
                 samplesCopied++
                 bytesCopied += sampleSize.toLong()
                 extractor.advance()

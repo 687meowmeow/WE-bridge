@@ -53,9 +53,27 @@ object ShaderTranscoder {
 
     /**
      * Check if the shader transcoder is available.
-     * Same native library as Etc2Encoder + DxtDecoder.
+     * v0.7.24 (H-S2 BUG FIX): `isLoaded` only proves the .so loaded — NOT that
+     * glslang+SPIRV-Cross were compiled in (CMake only warns when the fetch
+     * fails). The new native probe (compiled unconditionally, outside the
+     * GLSLANG_AVAILABLE guard) reports the real state so callers choose the
+     * regex fallback up front instead of eating an UnsatisfiedLinkError per
+     * call. Older builds without the probe symbol fall back to `false`.
      */
-    fun isAvailable(): Boolean = isLoaded
+    fun isAvailable(): Boolean {
+        if (!isLoaded) return false
+        return try {
+            nativeIsAvailable()
+        } catch (_: UnsatisfiedLinkError) {
+            // Probe symbol missing (pre-v0.7.24 .so) — assume unavailable so
+            // callers use the regex path instead of throw-per-call.
+            false
+        }
+    }
+
+    // v0.7.24 (H-S2): native availability probe — returns false when the
+    // .so was built without glslang+SPIRV-Cross.
+    private external fun nativeIsAvailable(): Boolean
 
     /**
      * Transcode an HLSL or GLSL shader to GLSL ES 3.00.

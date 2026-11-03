@@ -32,6 +32,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 #include "dxt_decoder.h"
 
 using namespace wepwawet;
@@ -89,6 +90,17 @@ Java_com_wepwawet_pairing_DxtDecoder_nativeDecodeDxt(
         }
         return nullptr;
     }
+    // v0.7.24 (C-N4-class guard): reject absurd dimensions up front — blocksX/blocksY
+    // and the output allocation are computed from these; anything above 16384
+    // exceeds the GLES3 GL_MAX_TEXTURE_SIZE floor on every shipping Android
+    // device and would only ever be a corrupted header.
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        jclass exc = env->FindClass("java/lang/IllegalArgumentException");
+        if (exc != nullptr) {
+            env->ThrowNew(exc, "Invalid dimensions (expected 1..16384)");
+        }
+        return nullptr;
+    }
     jbyte* src = env->GetByteArrayElements(srcBytes, nullptr);
     if (src == nullptr) {
         return nullptr; // OutOfMemoryError
@@ -109,34 +121,65 @@ Java_com_wepwawet_pairing_DxtDecoder_nativeDecodeDxt(
     }
 
     // Allocate output
-    size_t outLen = (size_t)width * height * 4;
-    std::vector<uint8_t> out(outLen);
-
-    // Decode
-    bool ok = decodeDxt((const uint8_t*)src, srcLen, width, height, fmt,
-                         out.data(), outLen,
-                         use1BitAlpha != JNI_TRUE);
-
-    // Release input (we have our own copy)
-    env->ReleaseByteArrayElements(srcBytes, src, JNI_ABORT);
-
-    if (!ok) {
-        jclass exc = env->FindClass("java/lang/RuntimeException");
+    // v0.7.24 (C-N3): std::bad_alloc must NOT unwind through the JNI boundary
+    // (undefined behavior) — catch it and surface a Java OutOfMemoryError.
+    size_t outLen = (size_t)width * (size_t)height * 4;
+    if (outLen > (size_t)INT32_MAX) {
+        env->ReleaseByteArrayElements(srcBytes, src, JNI_ABORT);
+        jclass exc = env->FindClass("java/lang/IllegalArgumentException");
         if (exc != nullptr) {
-            env->ThrowNew(exc, "DXT decoding failed (see logs)");
+            env->ThrowNew(exc, "Output too large for a Java array");
         }
         return nullptr;
     }
+    try {
+        std::vector<uint8_t> out(outLen);
 
-    // Wrap the output in a Java byte array
-    jbyteArray result = env->NewByteArray((jsize)outLen);
-    if (result == nullptr) {
-        return nullptr; // OutOfMemoryError
+        // Decode
+        // v0.7.24 (C-N1 BUG FIX): was `use1BitAlpha != JNI_TRUE` — a logical NOT
+        // that inverted the flag at the JNI boundary. Kotlin's
+        // `use1BitAlpha = true` means DXT1a (1-bit alpha), and decodeDxt's
+        // parameter has the SAME contract, so the flag must be passed through
+        // UNCHANGED. The old inversion shipped every DXT1a mask/alpha texture
+        // with opaque black instead of transparent black.
+        bool ok = decodeDxt((const uint8_t*)src, srcLen, width, height, fmt,
+                             out.data(), outLen,
+                             use1BitAlpha == JNI_TRUE);
+
+        // Release input (we have our own copy)
+        env->ReleaseByteArrayElements(srcBytes, src, JNI_ABORT);
+
+        if (!ok) {
+            jclass exc = env->FindClass("java/lang/RuntimeException");
+            if (exc != nullptr) {
+                env->ThrowNew(exc, "DXT decoding failed (see logs)");
+            }
+            return nullptr;
+        }
+
+        // Wrap the output in a Java byte array
+        jbyteArray result = env->NewByteArray((jsize)outLen);
+        if (result == nullptr) {
+            return nullptr; // OutOfMemoryError
+        }
+        env->SetByteArrayRegion(result, 0, (jsize)outLen,
+            reinterpret_cast<const jbyte*>(out.data()));
+
+        return result;
+    } catch (const std::bad_alloc&) {
+        jclass exc = env->FindClass("java/lang/OutOfMemoryError");
+        if (exc != nullptr) {
+            env->ThrowNew(exc, "native DXT output allocation failed");
+        }
+        return nullptr;
+    } catch (...) {
+        // v0.7.24 (C-N3): never let ANY exception unwind through JNI (UB).
+        jclass exc = env->FindClass("java/lang/RuntimeException");
+        if (exc != nullptr) {
+            env->ThrowNew(exc, "native DXT decoder threw an unknown exception");
+        }
+        return nullptr;
     }
-    env->SetByteArrayRegion(result, 0, (jsize)outLen,
-        reinterpret_cast<const jbyte*>(out.data()));
-
-    return result;
 }
 
 } // extern "C"

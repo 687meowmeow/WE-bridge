@@ -247,8 +247,11 @@ fun LogsScreen(onBack: () -> Unit) {
                     modifier = Modifier.fillMaxSize().padding(8.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    items(events.reversed(), key = { it.seq }) { entry ->
-                        LogEntryRow(entry)
+                    // v0.7.24 (M-U5): events.reversed() allocated a fresh
+                    // 5000-element list on EVERY recomposition (i.e. per log
+                    // entry). Index-based reverse iteration allocates nothing.
+                    items(events.size, key = { events[events.size - 1 - it].seq }) { i ->
+                        LogEntryRow(events[events.size - 1 - i])
                     }
                 }
             }

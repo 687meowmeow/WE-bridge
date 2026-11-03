@@ -389,9 +389,15 @@ object ShaderStageLink {
                         ) {
                             needs = 0
                             for (ch in sw.s) {
+                                // v0.7.24 (C-S1 BUG FIX): the old table
+                                // ("xrgs"->0, "ygbt"->1) matched top-down, so
+                                // 'g' hit the FIRST branch (returning 0 instead
+                                // of 1) and 'b' hit the SECOND (returning 1
+                                // instead of 2). GLSL swizzle letters:
+                                //   x=r=s -> 0;  y=g=t -> 1;  z=b=p -> 2;  w=a=q -> 3
                                 val idx = when (ch) {
-                                    in "xrgs" -> 0
-                                    in "ygbt" -> 1
+                                    in "xrs" -> 0
+                                    in "ygt" -> 1
                                     in "zbp" -> 2
                                     else -> 3
                                 }
@@ -602,13 +608,16 @@ object ShaderStageLink {
     fun harmonize(entries: MutableList<Pair<String, ByteArray>>): List<String> {
         val report = ArrayList<String>()
         // group stages by path stem
-        val byStem = HashMap<String, HashMap<String, Int>>()  // stem -> ext -> index
+        // v0.7.24 (M-S9): LinkedHashMap for DETERMINISTIC iteration order —
+        // a plain HashMap made the rewrite (and its report) depend on hash
+        // seeding, so the same wallpaper could pack differently per run.
+        val byStem = LinkedHashMap<String, LinkedHashMap<String, Int>>()  // stem -> ext -> index
         for ((i, e) in entries.withIndex()) {
             val lower = e.first.lowercase()
             if (!lower.endsWith(".vert") && !lower.endsWith(".frag") && !lower.endsWith(".geom")) continue
             val ext = e.first.substringAfterLast('.').lowercase()
             val stem = e.first.substringBeforeLast('.')
-            byStem.getOrPut(stem) { HashMap() }[ext] = i
+            byStem.getOrPut(stem) { LinkedHashMap() }[ext] = i
         }
         for ((stem, stages) in byStem) {
             val vertIdx = stages["vert"] ?: continue

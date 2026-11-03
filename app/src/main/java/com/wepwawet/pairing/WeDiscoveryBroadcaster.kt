@@ -207,6 +207,13 @@ class WeDiscoveryBroadcaster(private val context: Context) {
             runCatching { multicastSocket?.close() }
             multicastSocket = null
             runCatching { multicastLock?.let { if (it.isHeld) it.release() } }
+            // v0.7.24 (H-P7 BUG FIX): the loop's catch never reset `running`,
+            // so after any exception (e.g. a bind failure) isRunning kept
+            // returning true and PairingService's smart-restart NEVER
+            // relaunched discovery — the phone could never find this PC
+            // again until the whole app restarted. Reset unconditionally:
+            // the thread only reaches finally when it's done for good.
+            running = false
         }
     }
 

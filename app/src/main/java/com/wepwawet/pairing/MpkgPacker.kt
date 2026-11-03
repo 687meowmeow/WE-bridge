@@ -83,8 +83,13 @@ import android.graphics.BitmapFactory
  */
 object MpkgPacker {
 
-    const val MAGIC = "PKGM0020"  // default / ceiling — see [negotiateMagic] for the
-                                  // per-transfer selection (v0.7.4, parity G1)
+    // v0.7.24 (L-M1): documented — this constant is the CEILING/default only.
+    // negotiateMagic() selects the ACTUAL per-transfer magic: scene wallpapers
+    // use min(device-reported mpkgVersion, 20) so older phones receive e.g.
+    // PKGM0019; video wallpapers always use PKGM0014 (PC parity,
+    // FUN_14003d0e0). Packs written via pack() default to this value when a
+    // caller doesn't negotiate first.
+    const val MAGIC = "PKGM0020"
 
     const val HEADER_MARKER = 8
 
@@ -2545,9 +2550,40 @@ object MpkgPacker {
                         "exception" to e.javaClass.name)
                     return null
                 }
-                // Rebuild a normalized in-memory .tex: header[0..bodyStart) + raw body.
-                // bodyStart stays the same so downstream offsets hold.
-                texData.copyOf(info.bodyStart) + raw
+                // Rebuild a normalized in-memory .tex: header[0..bodyStart) +
+                // raw body, with the trailer fields REWRITTEN to describe the
+                // raw body. bodyStart stays the same so downstream offsets hold.
+                //
+                // v0.7.24 (C-M1 BUG FIX): the header used to be copied
+                // UNCHANGED — it still said IsLz4=1 with the old
+                // DecompressedSize/byteCount, so the effInfo = parse(...) on
+                // the very next line reported bodyIsLz4=true for an
+                // already-decompressed body, and any consumer honoring that
+                // flag (bodyBytes() slicing by the stale byteCount, or a
+                // re-decompress) corrupted or failed. Mirror what
+                // decompressTexBodyIfLz4 does:
+                //   TEXB0003: isLz4@75, decompSize@79, byteCount@83
+                //   TEXB0004: isLz4@79, decompSize@83, byteCount@87
+                val header = texData.copyOf(info.bodyStart)
+                fun writeU32Le(buf: ByteArray, off: Int, v: Int) {
+                    buf[off] = (v and 0xFF).toByte()
+                    buf[off + 1] = ((v ushr 8) and 0xFF).toByte()
+                    buf[off + 2] = ((v ushr 16) and 0xFF).toByte()
+                    buf[off + 3] = ((v ushr 24) and 0xFF).toByte()
+                }
+                when (info.texbVersion) {
+                    3 -> {
+                        writeU32Le(header, 75, 0)          // isLz4 = 0
+                        writeU32Le(header, 79, raw.size)   // decompSize = raw body size
+                        writeU32Le(header, 83, raw.size)   // byteCount = raw body size
+                    }
+                    4 -> {
+                        writeU32Le(header, 79, 0)          // isLz4 = 0
+                        writeU32Le(header, 83, raw.size)   // decompSize
+                        writeU32Le(header, 87, raw.size)   // byteCount
+                    }
+                }
+                header + raw
             } else {
                 texData
             }
@@ -4102,12 +4138,29 @@ object MpkgPacker {
         val vfsTableSize = entries.sumOf { 4 + it.first.toByteArray(Charsets.UTF_8).size + 4 + 4 }
         val dataSectionStart = headerSize + vfsTableSize
 
-        val vfsEntries: MutableList<Triple<String, Int, Int>> = mutableListOf()
-        var cursor = 0
+        // v0.7.24 (H-M1): validate the magic up front — the old check ran
+        // AFTER the header marker + magic bytes had already been flushed, so
+        // a wrong-length magic left a corrupt, truncated .mpkg on disk that
+        // the caller might still try to ship.
+        require(magic.length == 8) { "magic must be 8 bytes: '$magic'" }
+
+        // v0.7.24 (C-M2): cursor + sizes as Long. The old Int cursor wrapped
+        // NEGATIVE for >2 GiB total data (writeLeInt then emitted the
+        // wrong-as-u32 offsets into the VFS), and blob.size (Int) is negative
+        // for any single >2 GiB blob — silent VFS corruption. streamPack and
+        // packVideoWallpaper already had this guard; pack() did not.
+        var cursor = 0L
+        val vfsEntries: MutableList<Triple<String, Long, Long>> = mutableListOf()
         for (entry in entries) {
             val (name, blob) = entry
-            vfsEntries.add(Triple(name, cursor, blob.size))
-            cursor += blob.size
+            vfsEntries.add(Triple(name, cursor, blob.size.toLong()))
+            cursor += blob.size.toLong()
+        }
+        if (cursor > 0xFFFFFFFFL) {
+            WepWawetLogger.proxyError("MpkgPacker.pack: total data exceeds u32 VFS range — refusing to write",
+                "total_size" to cursor)
+            outputFile.delete()
+            return 0L
         }
 
         WepWawetLogger.proxy("MpkgPacker.pack layout computed",
@@ -4122,7 +4175,6 @@ object MpkgPacker {
         try {
             writeLeInt(out, HEADER_MARKER)
             out.write(magic.toByteArray(Charsets.US_ASCII))
-            if (magic.length != 8) error("magic must be 8 bytes: '$magic'")
             writeLeInt(out, entries.size)
 
             for (entry in vfsEntries) {
@@ -4130,8 +4182,9 @@ object MpkgPacker {
                 val nameBytes = name.toByteArray(Charsets.UTF_8)
                 writeLeInt(out, nameBytes.size)
                 out.write(nameBytes)
-                writeLeInt(out, offset)
-                writeLeInt(out, size)
+                // v0.7.24 (C-M2): Long→u32 with the range asserted above.
+                writeLeLongAsU32(out, offset)
+                writeLeLongAsU32(out, size)
             }
 
             for (entry in entries) {
@@ -4143,6 +4196,12 @@ object MpkgPacker {
             out.close()
         }
         return outputFile.length()
+    }
+
+    /** v0.7.24 (C-M2): write a Long as a little-endian u32, asserting range. */
+    private fun writeLeLongAsU32(out: OutputStream, value: Long) {
+        require(value in 0..0xFFFFFFFFL) { "u32 out of range: $value" }
+        writeLeInt(out, value.toInt())
     }
 
     private fun writeLeInt(out: OutputStream, value: Int) {

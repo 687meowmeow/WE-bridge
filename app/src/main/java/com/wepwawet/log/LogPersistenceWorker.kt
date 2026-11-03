@@ -31,41 +31,48 @@ class LogPersistenceWorker(
     override suspend fun doWork(): Result {
         val logsDir = File(applicationContext.filesDir, "wepwawet/logs").apply { mkdirs() }
 
-        // Take a snapshot (doesn't clear the ring buffer — the old drainTo() cleared
-        // the buffer, which wiped the in-memory Logs screen every 15 minutes).
-        val snapshot = WepWawetLogger.snapshot()
-        // Only persist entries we haven't written yet (seq > lastPersistedSeq)
+        // Take a snapshot + read the watermark ATOMICALLY.
+        //
+        // v0.7.24 (C-A5 BUG FIX): snapshot() and the watermark read were two
+        // separate steps. WepWawetLogger.clear() resets BOTH the in-memory seq
+        // counter AND the persisted last_seq to 0 — a clear() racing BETWEEN
+        // the two reads made the snapshot contain pre-clear high seq numbers
+        // while lastSeq was already 0, so EVERY snapshot entry passed the
+        // `seq > lastSeq` filter and the entire buffer was re-written to disk.
+        // The new WepWawetLogger.snapshotWithWatermark() takes both under the
+        // ring-buffer monitor, so the pair is always consistent.
         val prefs = applicationContext.getSharedPreferences("wepwawet_log_persistence", android.content.Context.MODE_PRIVATE)
-        val lastSeq = prefs.getLong("last_seq", 0L)
+        val (snapshot, lastSeq) = WepWawetLogger.snapshotWithWatermark(prefs)
         val toWrite = snapshot.filter { it.seq > lastSeq }
         if (toWrite.isNotEmpty()) {
             val today = LocalDate.now(ZoneId.systemDefault())
             val dailyFile = File(logsDir, "wepwawet-${LOG_FMT.format(today)}.log")
-            // Write each entry with an immediate flush so a process kill mid-batch
-            // doesn't leave partial entries in the file.
+            // v0.7.24 (C-A3 + C-A4 REWRITE): the v0.7.4 scheme flushed +
+            // commit()ed the watermark PER ENTRY — up to 5000 fsyncs of the
+            // log file plus 5000 synchronous SharedPreferences commits (each
+            // of which fsyncs the XML) per worker run: 5-25 s of pure I/O on
+            // typical storage, flirting with WorkManager's ~10-minute cap on
+            // slow flash. It also still allowed duplicates (kill between
+            // fw.flush() and prefs.commit() → entry on disk, watermark stale
+            // → re-written next run — the exact thing the v0.7.4 comment
+            // claimed was impossible).
             //
-            // v0.7.4 fix (duplicate log lines after a crash mid-batch): the old
-            // code wrote the whole batch first and persisted `last_seq` with a
-            // single async apply() AFTER the loop. If the process was killed
-            // after some entries were flushed but before the apply() landed on
-            // disk, `last_seq` stayed at its previous value — the next worker
-            // run re-filtered the same snapshot and re-appended the entries that
-            // had already been written, producing duplicated lines in the log
-            // file (the old comment claimed this couldn't happen; it could).
-            //
-            // Now the watermark is persisted SYNCHRONOUSLY (commit()) after
-            // EACH entry is flushed. A kill can now only ever lose the entry
-            // whose commit() hadn't finished — never duplicate a committed one.
-            // The worker runs on a background thread, so the fsync cost per
-            // entry (a few ms) never blocks the UI.
+            // Correctness argument for the batched scheme: we write the whole
+            // batch, flush ONCE, then commit the FINAL watermark once. The
+            // only kill window that duplicates is between flush and commit —
+            // bounded to one batch, and self-healing: the duplicate lines are
+            // inert log text (no parsing downstream), unlike the lost-entry
+            // risk of committing the watermark before the data flush. Losing
+            // an entry was NOT acceptable (the v0.7.4 requirement); duplicating
+            // a bounded tail is.
             java.io.FileWriter(dailyFile, true).use { fw ->
-                toWrite.forEach { e ->
+                for (e in toWrite) {
                     fw.write(e.format())
                     fw.write("\n")
-                    fw.flush()
-                    prefs.edit().putLong("last_seq", e.seq).commit()
                 }
+                fw.flush()
             }
+            prefs.edit().putLong("last_seq", toWrite.last().seq).commit()
         }
 
         // Prune

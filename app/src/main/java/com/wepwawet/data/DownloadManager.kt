@@ -33,6 +33,28 @@ object DownloadManager {
     private val _activeDownloads = MutableStateFlow<Map<String, DownloadProgress>>(emptyMap())
     val activeDownloads: StateFlow<Map<String, DownloadProgress>> = _activeDownloads.asStateFlow()
 
+    /**
+     * v0.7.24 (H-U2): cached per-item derived flows. WallpaperCard previously
+     * collected the WHOLE activeDownloads map + completedDownloads list — one
+     * progress tick from ANY download recomposed EVERY card in the grid (a
+     * 30-card grid = 30 recompositions, 10+ times per second). These flows
+     * only emit when THIS item's entry changes.
+     */
+    private val activeItemFlows = java.util.concurrent.ConcurrentHashMap<String, StateFlow<DownloadProgress?>>()
+    private val completedItemFlows = java.util.concurrent.ConcurrentHashMap<String, StateFlow<Boolean>>()
+
+    fun activeDownloadFor(itemId: String): StateFlow<DownloadProgress?> =
+        activeItemFlows.computeIfAbsent(itemId) { id ->
+            kotlinx.coroutines.flow.combine(activeDownloads) { m -> m[id] }
+                .stateIn(com.wepwawet.WepWawetApplication.appScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), null)
+        }
+
+    fun isCompletedFor(itemId: String): StateFlow<Boolean> =
+        completedItemFlows.computeIfAbsent(itemId) { id ->
+            kotlinx.coroutines.flow.combine(completedDownloads) { list -> list.any { it.itemId == id } }
+                .stateIn(com.wepwawet.WepWawetApplication.appScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), false)
+        }
+
     // ====== Completed downloads (history) ======
 
     private val _completedDownloads = MutableStateFlow<List<CompletedDownload>>(emptyList())

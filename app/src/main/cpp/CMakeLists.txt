@@ -139,12 +139,24 @@ target_compile_options(wepwawet_etc2 PRIVATE
     -O2
     -fvisibility=hidden -fvisibility-inlines-hidden
     -fexceptions -frtti
+    # v0.7.24 (M-N3): allow the linker to strip the dead vendored codec code
+    # (etc2comp/etcpack/bcdec export far more than we call) — smaller .so.
+    -ffunction-sections -fdata-sections
 )
+
+# v0.7.24 (M-N3): strip unused sections at link time.
+target_link_options(wepwawet_etc2 PRIVATE -Wl,--gc-sections)
 
 target_compile_definitions(wepwawet_etc2 PRIVATE
     ETC2_COMP_STATIC=1
-    NDEBUG  # Strip asserts in release builds for faster encoding
 )
+# v0.7.24 (M-N4): NDEBUG only for RELEASE builds — the unconditional define
+# disabled assert() even in debug builds, hiding texture-decoder bugs.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(wepwawet_etc2 PRIVATE ETC2_DEBUG=1)
+else()
+    target_compile_definitions(wepwawet_etc2 PRIVATE NDEBUG)
+endif()
 
 # Link with standard libraries
 target_link_libraries(wepwawet_etc2

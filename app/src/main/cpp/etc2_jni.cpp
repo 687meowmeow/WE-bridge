@@ -103,14 +103,26 @@ Java_com_wepwawet_pairing_Etc2Encoder_nativeEncodeEtc2Rgba8(
 
     // Get RGBA bytes from Java
     jsize input_size = env->GetArrayLength(rgba_bytes);
+    // v0.7.24 (C-N4): validate dimensions up front — `width * height * 4`
+    // overflows 32-bit signed arithmetic for >= 32769x32769 inputs (and
+    // jsize/jint is 32-bit), which made `expected_size` negative and BYPASSED
+    // this check, then crashed / corrupted the heap in the conversion loop.
+    // 16384 is the GLES3 GL_MAX_TEXTURE_SIZE floor on every Android device.
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        jclass exc = env->FindClass("java/lang/IllegalArgumentException");
+        if (exc != nullptr) {
+            env->ThrowNew(exc, "Invalid dimensions (expected 1..16384)");
+        }
+        return nullptr;
+    }
     jbyte *input_bytes = env->GetByteArrayElements(rgba_bytes, nullptr);
     if (input_bytes == nullptr) {
         return nullptr; // OutOfMemoryError already thrown
     }
 
-    // Validate size
-    jsize expected_size = (jsize)width * (jsize)height * 4;
-    if (input_size < expected_size) {
+    // Validate size (64-bit math — see C-N4 comment above)
+    int64_t expected_size64 = (int64_t)width * (int64_t)height * 4;
+    if ((int64_t)input_size < expected_size64) {
         env->ReleaseByteArrayElements(rgba_bytes, input_bytes, JNI_ABORT);
         jclass exc = env->FindClass("java/lang/IllegalArgumentException");
         if (exc != nullptr) {
@@ -120,19 +132,22 @@ Java_com_wepwawet_pairing_Etc2Encoder_nativeEncodeEtc2Rgba8(
     }
 
     // Convert raw RGBA bytes (0..255 each) to float array (0..1 each)
-    int pixel_count = width * height;
-    std::vector<float> rgba_floats(pixel_count * 4);
+    // v0.7.24 (C-N3): catch std::bad_alloc — unwinding through JNI is UB.
+    try {
+        // v0.7.24 (C-N4): 64-bit size math for the allocation.
+        size_t pixel_count = (size_t)width * (size_t)height;
+        std::vector<float> rgba_floats(pixel_count * 4);
 
-    for (int i = 0; i < pixel_count; i++) {
-        unsigned char r = (unsigned char)input_bytes[i * 4 + 0];
-        unsigned char g = (unsigned char)input_bytes[i * 4 + 1];
-        unsigned char b = (unsigned char)input_bytes[i * 4 + 2];
-        unsigned char a = (unsigned char)input_bytes[i * 4 + 3];
-        rgba_floats[i * 4 + 0] = r / 255.0f;  // R
-        rgba_floats[i * 4 + 1] = g / 255.0f;  // G
-        rgba_floats[i * 4 + 2] = b / 255.0f;  // B
-        rgba_floats[i * 4 + 3] = a / 255.0f;  // A
-    }
+        for (size_t i = 0; i < pixel_count; i++) {
+            unsigned char r = (unsigned char)input_bytes[i * 4 + 0];
+            unsigned char g = (unsigned char)input_bytes[i * 4 + 1];
+            unsigned char b = (unsigned char)input_bytes[i * 4 + 2];
+            unsigned char a = (unsigned char)input_bytes[i * 4 + 3];
+            rgba_floats[i * 4 + 0] = r / 255.0f;  // R
+            rgba_floats[i * 4 + 1] = g / 255.0f;  // G
+            rgba_floats[i * 4 + 2] = b / 255.0f;  // B
+            rgba_floats[i * 4 + 3] = a / 255.0f;  // A
+        }
 
     // Release the input bytes (we have our own copy now)
     env->ReleaseByteArrayElements(rgba_bytes, input_bytes, JNI_ABORT);
@@ -189,6 +204,21 @@ Java_com_wepwawet_pairing_Etc2Encoder_nativeEncodeEtc2Rgba8(
         reinterpret_cast<const jbyte *>(encoded));
 
     return output;
+    } catch (const std::bad_alloc&) {
+        // v0.7.24 (C-N3): surface OOM as a Java exception instead of
+        // unwinding C++ through the JNI boundary (UB).
+        jclass exc = env->FindClass("java/lang/OutOfMemoryError");
+        if (exc != nullptr) {
+            env->ThrowNew(exc, "native ETC2 encoder allocation failed");
+        }
+        return nullptr;
+    } catch (...) {
+        jclass exc = env->FindClass("java/lang/RuntimeException");
+        if (exc != nullptr) {
+            env->ThrowNew(exc, "native ETC2 encoder threw an unknown exception");
+        }
+        return nullptr;
+    }
 }
 
 } // extern "C"

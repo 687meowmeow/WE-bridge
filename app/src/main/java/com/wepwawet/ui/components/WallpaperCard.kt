@@ -81,10 +81,13 @@ fun WallpaperCard(
 ) {
     // Subscribe to download manager state so the card updates live when
     // a download starts/finishes for this item.
-    val activeDownloads by DownloadManager.activeDownloads.collectAsState()
-    val completedDownloads by DownloadManager.completedDownloads.collectAsState()
-    val activeDownload = activeDownloads[item.id]
-    val isCompleted = completedDownloads.any { it.itemId == item.id }
+    // v0.7.24 (H-U2 BUG FIX): was `activeDownloads.collectAsState()` +
+    // `completedDownloads.collectAsState()` — every card collected the WHOLE
+    // map/list, so one progress tick from ANY download recomposed EVERY card
+    // in the grid (30 cards x 10+ ticks/sec). The per-item derived flows only
+    // emit when THIS item's entry changes.
+    val activeDownload by DownloadManager.activeDownloadFor(item.id).collectAsState()
+    val isCompleted by DownloadManager.isCompletedFor(item.id).collectAsState()
 
     val maturity = WorkshopTags.getMaturity(item.tags)
     val isMobile = WorkshopTags.isMobileCompatible(item.type)

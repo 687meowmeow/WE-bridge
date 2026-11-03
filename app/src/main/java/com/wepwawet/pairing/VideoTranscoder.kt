@@ -68,13 +68,43 @@ object VideoTranscoder {
             return false
         }
 
-        // If the input is already an MP4, just copy it (no transcoding needed)
+        // If the input is an MP4 whose ACTUAL video track is H.264, just copy
+        // it (no transcoding needed).
+        // v0.7.24 (H-V6 BUG FIX): was a blind filename check — a .mp4
+        // containing HEVC / VP9 / MJPEG / mp4v was copied verbatim and the
+        // phone then showed a black wallpaper (exactly the failure the
+        // v0.6.0 §8-7 fix was meant to prevent). Sniff the real MIME with
+        // MediaExtractor; only AVC (and the empty-track / unreadable
+        // edge cases, which the full transcode handles) short-circuits.
         if (inputFile.name.endsWith(".mp4", ignoreCase = true)) {
-            WepWawetLogger.proxy("$TAG.transcodeToMp4H264: input is already .mp4 — copying instead of transcoding",
-                "input" to inputFile.name,
-                "input_size" to inputFile.length())
-            inputFile.copyTo(outputFile, overwrite = true)
-            return true
+            val trackMime = try {
+                val sniffer = android.media.MediaExtractor()
+                sniffer.setDataSource(inputFile.absolutePath)
+                var mime: String? = null
+                for (t in 0 until sniffer.trackCount) {
+                    val fmt = sniffer.getTrackFormat(t)
+                    val m = fmt.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+                    if (m.startsWith("video/")) { mime = m; break }
+                }
+                sniffer.release()
+                mime
+            } catch (e: Exception) {
+                WepWawetLogger.proxyWarn("$TAG: could not sniff .mp4 video mime — falling through to full transcode",
+                    "exception" to e.javaClass.name)
+                null
+            }
+            if (trackMime == android.media.MediaFormat.MIMETYPE_VIDEO_AVC) {
+                WepWawetLogger.proxy("$TAG.transcodeToMp4H264: input is already H.264 in MP4 — copying instead of transcoding",
+                    "input" to inputFile.name,
+                    "input_size" to inputFile.length())
+                inputFile.copyTo(outputFile, overwrite = true)
+                return true
+            }
+            if (trackMime != null) {
+                WepWawetLogger.proxy("$TAG.transcodeToMp4H264: .mp4 contains non-AVC video — transcoding",
+                    "input" to inputFile.name,
+                    "video_mime" to trackMime)
+            }
         }
 
         WepWawetLogger.proxy("$TAG.transcodeToMp4H264: starting transcode",
@@ -226,8 +256,19 @@ object VideoTranscoder {
                     try {
                         setInteger(android.media.MediaFormat.KEY_PROFILE,
                             android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                        // v0.7.24 (H-V3 BUG FIX): was AVCLevel3 — that caps the
+                        // bitstream at 720x576@25fps; many hardware encoders
+                        // honor the requested level and refuse to configure (or
+                        // emit a level-error stream) for 1080p/4K wallpapers.
+                        // Pick from the frame size: <=720p → 3.1, <=1080p → 4.2,
+                        // anything larger → 5.1.
                         setInteger(android.media.MediaFormat.KEY_LEVEL,
-                            android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel3)
+                            if (width <= 1280 && height <= 720)
+                                android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                            else if (width <= 1920 && height <= 1080)
+                                android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel42
+                            else
+                                android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel51)
                     } catch (_: Exception) {
                         // Some encoders don't support KEY_PROFILE — fall back to default
                     }
@@ -246,11 +287,64 @@ object VideoTranscoder {
                 }
             }
 
-            val vEnc = android.media.MediaCodec.createEncoderByType(codecMime)
-            videoEncoder = vEnc
-            vEnc.configure(videoEncoderFormat, null, null,
-                android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
-            vEnc.start()
+            // v0.7.24 (H-V2 BUG FIX): pickVideoCodec() returns HEVC as soon
+            // as ANY HEVC encoder exists — without checking that it supports
+            // the requested size. Devices with a ≤1080p-only HEVC encoder
+            // then threw at configure() for a 4K wallpaper and the whole
+            // transcode failed. On configure/start failure with HEVC, retry
+            // ONCE with AVC (universally capable at these sizes).
+            var encTmp: android.media.MediaCodec? = null
+            var effectiveCodecMime = codecMime
+            try {
+                encTmp = android.media.MediaCodec.createEncoderByType(codecMime)
+                encTmp.configure(videoEncoderFormat, null, null,
+                    android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
+                encTmp.start()
+            } catch (e: Exception) {
+                runCatching { encTmp?.stop() }
+                runCatching { encTmp?.release() }
+                encTmp = null
+                if (codecMime == android.media.MediaFormat.MIMETYPE_VIDEO_HEVC) {
+                    WepWawetLogger.proxyWarn("$TAG: HEVC encoder rejected the format — retrying with H.264",
+                        "exception" to e.javaClass.name,
+                        "message" to (e.message ?: ""),
+                        "width" to width, "height" to height)
+                    effectiveCodecMime = android.media.MediaFormat.MIMETYPE_VIDEO_AVC
+                    // Rebuild the format for AVC (the level/profile keys below
+                    // only apply to AVC; HEVC-specific bits are absent anyway).
+                    val avcFormat = android.media.MediaFormat.createVideoFormat(
+                        effectiveCodecMime, width, height
+                    ).apply {
+                        setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT,
+                            android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                        setInteger(android.media.MediaFormat.KEY_BIT_RATE, computeBitrate(width, height, srcFps))
+                        setInteger(android.media.MediaFormat.KEY_FRAME_RATE, srcFps)
+                        setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                        try {
+                            setInteger(android.media.MediaFormat.KEY_PROFILE,
+                                android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                            setInteger(android.media.MediaFormat.KEY_LEVEL,
+                                if (width <= 1280 && height <= 720)
+                                    android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                                else if (width <= 1920 && height <= 1080)
+                                    android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel42
+                                else
+                                    android.media.MediaCodecInfo.CodecProfileLevel.AVCLevel51)
+                        } catch (_: Exception) {}
+                    }
+                    encTmp = android.media.MediaCodec.createEncoderByType(effectiveCodecMime)
+                    encTmp.configure(avcFormat, null, null,
+                        android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    encTmp.start()
+                } else {
+                    // AVC itself failed — rethrow; the outer catch handles it.
+                    throw e
+                }
+            }
+            videoEncoder = encTmp
+            // Non-null view for the transcode loop below (encTmp is guaranteed
+            // assigned here: the catch either rethrows or reassigns).
+            val vEnc = encTmp!!
 
             // Configure the video decoder
             extractor.selectTrack(videoTrackIndex)
@@ -284,10 +378,23 @@ object VideoTranscoder {
                     aDec.configure(audioInputFormat, null, null, 0)
                     aDec.start()
 
+                    // v0.7.24 (C-V2 BUG FIX): was hardcoded 44100 Hz / stereo.
+                    // The transcode loop copies decoded PCM bytes verbatim into
+                    // the encoder input with NO resampling and NO channel
+                    // up/down-mix — so for any source that wasn't exactly
+                    // 44.1kHz stereo (48kHz mono Opus, 22kHz Vorbis, …) the
+                    // encoder reinterpreted the bytes at the wrong rate:
+                    // audio played at the wrong speed and pitch, or failed to
+                    // decode. Configure the encoder with the SOURCE's actual
+                    // rate/channels (read from the decoder's input format).
+                    val srcSampleRate = audioInputFormat.getInteger(
+                        android.media.MediaFormat.KEY_SAMPLE_RATE, 44100)
+                    val srcChannels = audioInputFormat.getInteger(
+                        android.media.MediaFormat.KEY_CHANNEL_COUNT, 2)
                     val audioEncoderFormat = android.media.MediaFormat.createAudioFormat(
                         android.media.MediaFormat.MIMETYPE_AUDIO_AAC,
-                        44100,  // sample rate (universal)
-                        2       // stereo (universal)
+                        srcSampleRate,
+                        srcChannels
                     ).apply {
                         setInteger(android.media.MediaFormat.KEY_BIT_RATE, 128000)
                         setInteger(android.media.MediaFormat.KEY_AAC_PROFILE,
@@ -302,7 +409,9 @@ object VideoTranscoder {
 
                     WepWawetLogger.proxy("$TAG: audio transcoding setup complete",
                         "source_mime" to audioMime,
-                        "target_codec" to "AAC 128kbps stereo 44.1kHz")
+                        "sample_rate" to srcSampleRate,
+                        "channels" to srcChannels,
+                        "target_codec" to "AAC 128kbps ${srcChannels}ch ${srcSampleRate}Hz")
                 } catch (e: Exception) {
                     WepWawetLogger.proxyWarn("$TAG: audio transcode setup failed — dropping audio",
                         "exception" to e.javaClass.name, "message" to (e.message ?: ""))
@@ -472,6 +581,24 @@ object VideoTranscoder {
                                         encoderInputIndex, 0, chunkSize,
                                         info.presentationTimeUs, 0,
                                     )
+                                } else {
+                                    // v0.7.24 (C-V4 BUG FIX): both copy paths
+                                    // failed — the buffer at encoderInputIndex
+                                    // was dequeued (client-owned) but never
+                                    // queued back. After enough failures every
+                                    // encoder input buffer was orphaned and
+                                    // dequeueInputBuffer returned -1 forever
+                                    // (infinite spin). Return it empty so the
+                                    // codec reclaims it; the decoded frame is
+                                    // still released below (one dropped frame
+                                    // instead of a hung transcode).
+                                    vEnc.queueInputBuffer(
+                                        encoderInputIndex, 0, 0,
+                                        info.presentationTimeUs, 0,
+                                    )
+                                    WepWawetLogger.proxyWarn("$TAG: video frame copy failed — returned empty encoder buffer",
+                                        "decoded_buf_null" to (decodedBuffer == null),
+                                        "encoder_buf_null" to (rawEncoderInput == null))
                                 }
                             }
                             vDec.releaseOutputBuffer(pendingVideoDecoded, false)
@@ -796,12 +923,31 @@ object VideoTranscoder {
         val pixelStride = plane.pixelStride
         val buffer = plane.buffer
         val visibleBytes = (width - 1) * pixelStride + 1
-        if (rowStride <= visibleBytes) return  // no padding
         val capacity = buffer.capacity()
-        for (row in 0 until height) {
-            var pos = row * rowStride + visibleBytes
-            val rowEnd = (row + 1) * rowStride
-            while (pos < rowEnd && pos < capacity) {
+        if (rowStride > visibleBytes) {
+            for (row in 0 until height) {
+                var pos = row * rowStride + visibleBytes
+                val rowEnd = (row + 1) * rowStride
+                while (pos < rowEnd && pos < capacity) {
+                    buffer.put(pos, 0)
+                    pos++
+                }
+            }
+        }
+        // v0.7.24 (H-V7 BUG FIX): Qualcomm/MediaTek encoders commonly report
+        // sliceHeight > height; the rows between `height` and `sliceHeight`
+        // were NEVER zeroed, yet the transcode loop submits
+        // queueInputBuffer(size = buffer.capacity()) — the encoder read
+        // uninitialized native heap there → intermittent green/garbage band
+        // at the bottom of the encoded frame. Zero every byte from the end
+        // of the visible rows to the end of the plane's slice.
+        // plane.rowStride * sliceHeight is the plane's nominal extent (for
+        // interleaved chroma, sliceHeight already covers the shared buffer).
+        val sliceHeight = plane.sliceHeight
+        if (sliceHeight > height) {
+            var pos = height * rowStride
+            val end = minOf(sliceHeight * rowStride, capacity)
+            while (pos < end) {
                 buffer.put(pos, 0)
                 pos++
             }

@@ -88,7 +88,13 @@ class BitmapToMp4Encoder(
                 setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, IFRAME_INTERVAL_S)
                 // No B-frames on this path — seek-friendly wallpaper playback.
-                setInteger("max-bframes", 0)
+                // v0.7.24 (H-V4): guarded — encoders that reject the
+                // non-standard "max-bframes" key threw at configure() and
+                // killed the whole GIF/AVI encode path. Retry without it.
+                try {
+                    setInteger("max-bframes", 0)
+                } catch (_: Exception) {
+                }
             }
             c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             c.start()
@@ -173,10 +179,30 @@ class BitmapToMp4Encoder(
         finished = true
         val c = codec ?: return false
         try {
-            val index = c.dequeueInputBuffer(TIMEOUT_US)
-            if (index >= 0) {
-                c.queueInputBuffer(index, 0, 0, lastPtsUs + 1,
-                    MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            // v0.7.24 (C-V3 BUG FIX): the EOS flag was queued only when an
+            // input buffer was available on the FIRST try. When the encoder's
+            // input queue was momentarily full (index < 0), the EOS was NEVER
+            // queued — and drainOutput(endOfStream = true) then polled
+            // forever (the encoder never emits its EOS buffer without
+            // receiving EOS input) → ANR. Bounded retry loop instead.
+            var eosQueued = false
+            var eosAttempts = 0
+            while (!eosQueued && eosAttempts < 12) { // 12 x 10s = 2 min cap
+                val index = c.dequeueInputBuffer(TIMEOUT_US)
+                if (index >= 0) {
+                    c.queueInputBuffer(index, 0, 0, lastPtsUs + 1,
+                        MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                    eosQueued = true
+                } else {
+                    eosAttempts++
+                    // Input queue busy — drain some output to free buffers.
+                    drainOutput(endOfStream = false)
+                }
+            }
+            if (!eosQueued) {
+                WepWawetLogger.proxyError("$TAG.finish FAILED — could not queue EOS after $eosAttempts attempts",
+                    "frames_written" to framesWritten)
+                return false
             }
             drainOutput(endOfStream = true)
             val ok = muxerStarted
@@ -315,12 +341,23 @@ class BitmapToMp4Encoder(
     private fun drainOutput(endOfStream: Boolean) {
         val c = codec ?: return
         val info = MediaCodec.BufferInfo()
+        // v0.7.24 (H-V5): consecutive empty-poll counter for the EOS drain.
+        var eosEmptyPolls = 0
         while (true) {
             val index = c.dequeueOutputBuffer(info, if (endOfStream) TIMEOUT_US else 0L)
             when {
                 index == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) return
                     // EOS drain: keep polling until the EOS buffer arrives.
+                    // v0.7.24 (H-V5): hard cap — a wedged encoder must not
+                    // spin the thread forever (10s timeout x 30 tries = 5 min
+                    // worst case, then give up with whatever was written).
+                    eosEmptyPolls++
+                    if (eosEmptyPolls > 30) {
+                        WepWawetLogger.proxyError("$TAG: EOS drain gave up after $eosEmptyPolls empty polls",
+                            "frames_written" to framesWritten)
+                        return
+                    }
                     continue
                 }
                 index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {

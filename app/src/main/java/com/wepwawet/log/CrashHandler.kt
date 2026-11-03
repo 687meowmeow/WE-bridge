@@ -132,31 +132,36 @@ class CrashHandler private constructor(
         // or ArrayIndexOutOfBoundsException. Fix: the helper thread writes to its
         // OWN StringBuilder, and the main thread appends the result after join.
         runCatching {
-            val helperSb = StringBuilder()
-            val snapshotThread = kotlin.concurrent.thread(start = true, isDaemon = true) {
+            // v0.7.24 (C-A2 BUG FIX): the v0.7.21 attempt gave the helper its
+            // own StringBuilder but still READ it after a join(2000) timeout
+            // while the helper could be mid-append — StringBuilder reads
+            // during a concurrent resize are NOT safe (stale array reference /
+            // ArrayIndexOutOfBoundsException), acknowledged in the old comment
+            // and shipped anyway. CountDownLatch + finished-flag: the helper's
+            // output is only appended when the helper COMPLETED within the
+            // budget; on timeout we write a marker and move on.
+            val latch = java.util.concurrent.CountDownLatch(1)
+            @Volatile var helperOutput: String? = null
+            kotlin.concurrent.thread(start = true, isDaemon = true) {
                 runCatching {
+                    val helperSb = StringBuilder()
                     WepWawetLogger.snapshot().forEach { entry ->
                         helperSb.append(entry.format()).append("\n")
                     }
+                    helperOutput = helperSb.toString()
                 }
+                latch.countDown()
             }
-            try {
-                snapshotThread.join(2000)
+            val finished = try {
+                latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
+                false
             }
-            // Append whatever the helper thread managed to write (may be
-            // partial if the join timed out). This is safe because after
-            // join(2000) returns, the helper thread has either finished or
-            // is still running — but it's writing to helperSb, not sb.
-            // There's a small risk of concurrent helperSb read here if the
-            // helper is still running, but StringBuilder reads are less
-            // dangerous than concurrent writes, and the worst case is a
-            // truncated log section.
-            if (helperSb.isNotEmpty()) {
-                sb.append(helperSb)
+            if (finished) {
+                sb.append(helperOutput ?: "")
             } else {
-                sb.append("(log snapshot timed out)\n")
+                sb.append("(log snapshot timed out after 2s — ring buffer possibly locked)\n")
             }
         }
 
@@ -205,6 +210,19 @@ class CrashHandler private constructor(
         val latestName = "crash-latest.txt"
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // v0.7.24 (H-A4 BUG FIX): the previous crash-latest.txt row
+                // was never deleted, so MediaStore auto-renamed every new
+                // write to "crash-latest (1).txt", "(2).txt", … — the user
+                // saw a growing pile of "latest" files while the actual
+                // crash-latest.txt stayed frozen at the first crash. Delete
+                // the existing row (only OURS — we own it) before inserting.
+                val resolver = context.contentResolver
+                resolver.delete(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND " +
+                        "${MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                    arrayOf(latestName, "Download/WepWawet/"),
+                )
                 writeViaMediaStore(context, latestName, report)
             } else {
                 writeLegacyDownloads(latestName, report)

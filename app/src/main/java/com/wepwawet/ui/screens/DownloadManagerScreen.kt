@@ -83,7 +83,9 @@ fun DownloadManagerScreen(
     val active by DownloadManager.activeDownloads.collectAsState()
     val completed by DownloadManager.completedDownloads.collectAsState()
 
-    val activeList = active.values.toList().sortedBy { it.title }
+    // v0.7.24 (M-U6): derivedStateOf — the sorted copy was recomputed on every
+    // recomposition of the screen (not just when the active map changed).
+    val activeList by remember { androidx.compose.runtime.derivedStateOf { active.values.toList().sortedBy { it.title } } }
     val completedList = completed // most-recent-first ordering enforced by DownloadManager
 
     Scaffold(

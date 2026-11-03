@@ -78,6 +78,14 @@ class WePairingServer {
     companion object {
         private const val TAG = "WEP-PAIRING"
         const val TCP_PORT = 7889
+
+        /**
+         * v0.7.24 (H-P8): Max simultaneously-live pairing connections. The
+         * proxy speaks to ONE phone at a time; a small cap absorbs the WE
+         * app's reconnect churn while stopping runaway thread spawn from
+         * scanners.
+         */
+        const val MAX_CONCURRENT_CONNECTIONS = 4
         const val MAX_SAFE_COMMAND_LENGTH = 4096
         // VERIFIED from decompiled TcpClient.java (headless RE):
         //   MAX_SAFE_COMMAND_LENGTH = 4096
@@ -118,13 +126,29 @@ class WePairingServer {
 
     private var serverSocket: ServerSocket? = null
     @Volatile private var running = false
-    private var rsaKeyPair: KeyPair? = null
+    @Volatile private var rsaKeyPair: KeyPair? = null
 
     // Current pairing state
-    private var currentPin: String = ""
-    private var currentAesKey: SecretKey? = null
-    private var currentIv: IvParameterSpec? = null
+    // v0.7.24 (C-P2/M-P4/M-P5): @Volatile — these are written by the pairing
+    // handshake thread and read by the command-loop + transfer threads.
+    @Volatile private var currentPin: String = ""
+    @Volatile private var currentAesKey: SecretKey? = null
+    @Volatile private var currentIv: IvParameterSpec? = null
     @Volatile private var currentClient: Socket? = null
+
+    // v0.7.24 (H-P8): bounded connection acceptance. The old accept loop
+    // spawned an unbounded thread per incoming TCP connection — a scanner
+    // (or the WE app stuck in a reconnect loop) could spawn hundreds of
+    // threads each blocking on readFully. Beyond MAX_CONCURRENT_CONNECTIONS
+    // live connections, new sockets are closed immediately.
+    private val liveConnections = java.util.concurrent.atomic.AtomicInteger(0)
+
+    // v0.7.24 (H-P8): bounded connection acceptance. The old accept loop
+    // spawned an unbounded thread per incoming TCP connection — a scanner
+    // (or the WE app stuck in a reconnect loop) could spawn hundreds of
+    // threads each blocking on readFully. Beyond MAX_CONCURRENT_CONNECTIONS
+    // live connections, new sockets are closed immediately.
+    private val liveConnections = java.util.concurrent.atomic.AtomicInteger(0)
 
     // Callbacks
     var onPinRequested: (() -> String)? = null
@@ -235,7 +259,10 @@ class WePairingServer {
 
         WepWawetLogger.proxy("Pairing server starting",
             "port" to TCP_PORT,
-            "pin" to pin,
+            // v0.7.24 (C-P3): PIN redacted — with the default PIN "1234"
+            // this was a trivial device-takeover vector for anyone reading
+            // the logs. Log only whether a custom PIN is set.
+            "pin" to if (pin == "1234") "default" else "custom(${pin.length})",
             "rsa_key_size" to RSA_KEY_SIZE,
             "rsa_keypair_source" to if (keyPair != null) "external (persistent)" else "generated (ephemeral)")
 
@@ -282,9 +309,21 @@ class WePairingServer {
                     val client = serverSocket?.accept() ?: break
                     WepWawetLogger.proxy("Incoming connection",
                         "remote" to (client.remoteSocketAddress.toString()))
-
+                    // v0.7.24 (H-P8): reject connections beyond the cap.
+                    if (liveConnections.incrementAndGet() > MAX_CONCURRENT_CONNECTIONS) {
+                        liveConnections.decrementAndGet()
+                        WepWawetLogger.proxyWarn("Connection rejected — too many live connections",
+                            "live" to liveConnections.get(),
+                            "max" to MAX_CONCURRENT_CONNECTIONS)
+                        runCatching { client.close() }
+                        continue
+                    }
                     thread(start = true, name = "wep-pairing-conn", isDaemon = true) {
-                        handleConnection(client)
+                        try {
+                            handleConnection(client)
+                        } finally {
+                            liveConnections.decrementAndGet()
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -552,8 +591,10 @@ class WePairingServer {
                 input.readFully(encAuthReqBytes)
 
                 val authReqJson = String(aesCipher.doFinal(encAuthReqBytes), Charsets.UTF_8)
+                // v0.7.24 (C-P3): the raw authReqJson contains the PIN in
+                // cleartext — log a REDACTED copy instead.
                 WepWawetLogger.proxy("Received EncAuthRequest",
-                    "json" to authReqJson)
+                    "json" to authReqJson.replace(Regex("\"pin\"\\s*:\\s*\"[^\"]*\""), "\"pin\":\"***\""))
 
                 // Step 5: Parse EncAuthRequest (JSON via Gson)
                 // Expected fields: pin, name, deviceUserName, displayWidth, displayHeight,
@@ -562,7 +603,7 @@ class WePairingServer {
                 val authReq = gson.fromJson(authReqJson, EncAuthRequest::class.java)
 
                 WepWawetLogger.proxy("EncAuthRequest parsed",
-                    "pin" to (authReq.pin ?: ""),
+                    "pin" to if ((authReq.pin ?: "").isEmpty()) "none" else "redacted",
                     "name" to (authReq.name ?: ""),
                     "deviceUserName" to (authReq.deviceUserName ?: ""),
                     "displayWidth" to (authReq.displayWidth ?: 0),
@@ -574,8 +615,10 @@ class WePairingServer {
                 // Step 6: Verify PIN and version
                 val pinValid = authReq.pin == currentPin
                 WepWawetLogger.proxy("PIN verification",
-                    "received_pin" to (authReq.pin ?: ""),
-                    "expected_pin" to currentPin,
+                    // v0.7.24 (C-P3): never log either PIN — the outcome
+                    // ("valid") is all the debugging value anyone needs.
+                    "received_pin" to "redacted",
+                    "expected_pin" to "redacted",
                     "valid" to pinValid)
 
                 // v0.6.0 (parity §3 C-2-3): send AuthFailedVersion when the phone's
@@ -658,7 +701,14 @@ class WePairingServer {
                     runCatching { older.close() }
                 }
                 currentClient = client
-                it.soTimeout = 0  // Remove timeout for command loop
+                // v0.7.24 (H-P5): was `soTimeout = 0` (block forever). With no
+                // timeout, a peer that vanishes without FIN/RST (Wi-Fi drop)
+                // left this thread blocked in readFully FOREVER. The phone
+                // heartbeats every ~3-5s, so a 65s read timeout is >10 missed
+                // heartbeats — a dead-peer detector, not a liveness risk.
+                // SocketTimeoutException propagates to the loop's catch and
+                // the connection is cleaned up like any other disconnect.
+                it.soTimeout = 65_000
 
                 val deviceName = authReq.deviceUserName ?: authReq.name ?: "Unknown"
                 WepWawetLogger.proxy("Pairing successful!",
@@ -748,9 +798,18 @@ class WePairingServer {
      *   writeLeInt(ciphertext_length) + AES_encrypted(JSON)
      * Each call creates a FRESH cipher (the phone does the same on its read side).
      */
+    /** v0.7.24 (C-P2): immutable session-crypto snapshot for a transfer. */
+    private class CryptoSnapshot(val key: SecretKey, val iv: IvParameterSpec)
+
     private fun sendEncryptedJson(output: DataOutputStream, obj: Any) {
         val json = gson.toJson(obj)
         sendEncryptedJsonString(output, json)
+    }
+
+    /** v0.7.24 (C-P2): transfer-path variant using an immutable crypto snapshot. */
+    private fun sendEncryptedJson(output: DataOutputStream, obj: Any, crypto: CryptoSnapshot) {
+        val json = gson.toJson(obj)
+        sendEncryptedJsonString(output, json, crypto)
     }
 
     /**
@@ -779,6 +838,20 @@ class WePairingServer {
         }
     }
 
+    /** v0.7.24 (C-P2): transfer-path variant using an immutable crypto snapshot. */
+    private fun sendEncryptedJsonString(output: DataOutputStream, json: String, crypto: CryptoSnapshot) {
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, crypto.key, crypto.iv)
+        val ciphertext = cipher.doFinal(json.toByteArray(Charsets.UTF_8))
+        // NOTE: the outer transferWallpaperLocked already holds outputLock
+        // (re-entrant), keeping write+flush atomic within the transfer.
+        synchronized(outputLock) {
+            writeLeInt(output, ciphertext.size)
+            output.write(ciphertext)
+            output.flush()
+        }
+    }
+
     /**
      * Send AES-encrypted raw data (file chunk) to the phone.
      * Mirrors TcpClient$Companion.sendEncryptedGSONObject but for raw bytes:
@@ -793,6 +866,18 @@ class WePairingServer {
     private fun sendEncryptedData(output: DataOutputStream, data: ByteArray) {
         val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
         cipher.init(Cipher.ENCRYPT_MODE, currentAesKey, currentIv)
+        val ciphertext = cipher.doFinal(data)
+        synchronized(outputLock) {
+            writeLeInt(output, ciphertext.size)
+            output.write(ciphertext)
+            output.flush()
+        }
+    }
+
+    /** v0.7.24 (C-P2): transfer-path variant using an immutable crypto snapshot. */
+    private fun sendEncryptedData(output: DataOutputStream, data: ByteArray, crypto: CryptoSnapshot) {
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, crypto.key, crypto.iv)
         val ciphertext = cipher.doFinal(data)
         synchronized(outputLock) {
             writeLeInt(output, ciphertext.size)
@@ -831,9 +916,24 @@ class WePairingServer {
         // block can report the REAL bytes-sent-so-far — the old catch logged
         // `mpkgFile.length() - 0` (the total file size, not progress).
         var bytesSent = 0L
+        // v0.7.24 (C-P2 BUG FIX): snapshot the session crypto BEFORE the
+        // transfer begins. The transfer runs on its own thread and can take
+        // 30+s; meanwhile a NEW phone pairing on another connection-thread
+        // overwrites currentAesKey/currentIv mid-flight — the remaining
+        // chunks were then encrypted with the WRONG session's key (silent
+        // transfer corruption) or NPE'd when stop() nulled the fields. The
+        // snapshot makes the transfer's crypto immutable for its lifetime.
+        val cryptoKey = currentAesKey
+        val cryptoIv = currentIv
+        if (cryptoKey == null || cryptoIv == null) {
+            WepWawetLogger.proxyError("transferWallpaper aborted — no active session crypto",
+                "file" to mpkgFile.name)
+            return
+        }
+        val crypto = CryptoSnapshot(cryptoKey, cryptoIv)
         try {
             synchronized(outputLock) {
-                bytesSent = transferWallpaperLocked(output, mpkgFile, title)
+                bytesSent = transferWallpaperLocked(output, mpkgFile, title, crypto)
             }
         } catch (e: Exception) {
             WepWawetLogger.proxyError("transferWallpaper FAILED",
@@ -842,9 +942,12 @@ class WePairingServer {
                 "message" to (e.message ?: ""),
                 "bytes_sent_so_far" to bytesSent,
                 exception = e)
-            // Send cancel so the phone stops appending to tempWriteFile
+            // Send cancel so the phone stops appending to tempWriteFile.
+            // v0.7.24 (C-P2): uses the SAME captured session crypto — the
+            // field may have been replaced by a newer pairing while this
+            // transfer was in flight.
             try {
-                sendEncryptedJson(output, DownloadInfo(command = "transmissionCancel"))
+                sendEncryptedJson(output, DownloadInfo(command = "transmissionCancel"), crypto)
             } catch (_: Exception) {}
         }
     }
@@ -855,6 +958,7 @@ class WePairingServer {
         output: DataOutputStream,
         mpkgFile: java.io.File,
         title: String,
+        crypto: CryptoSnapshot,
     ): Long {
         val totalSize = mpkgFile.length()
         // Use just the filename without "wallpapers/" prefix.
@@ -892,7 +996,7 @@ class WePairingServer {
             // Step 1: beginUpload — phone removes any existing entry with
             // this file path, creates a fresh WallpaperInfoSparse, adds to UI.
             WepWawetLogger.proxy("transferWallpaper: sending beginUpload")
-            sendEncryptedJson(output, DownloadInfo(command = "beginUpload"))
+            sendEncryptedJson(output, DownloadInfo(command = "beginUpload"), crypto)
             WepWawetLogger.proxy("transferWallpaper: sent beginUpload")
 
             // Step 2: transmissionStart — phone creates tempWriteFile and
@@ -904,7 +1008,7 @@ class WePairingServer {
                 title = title,
                 file = fileName,
                 size = totalSize,
-            ))
+            ), crypto)
             WepWawetLogger.proxy("transferWallpaper: sent transmissionStart",
                 "file" to fileName, "size" to totalSize)
 
@@ -946,10 +1050,10 @@ class WePairingServer {
                     sendEncryptedJson(output, DownloadInfo(
                         command = "transmissionContinue",
                         size = 1L,  // >0 means "read encrypted data next"
-                    ))
+                    ), crypto)
 
                     // Send the AES-encrypted chunk data
-                    sendEncryptedData(output, chunk)
+                    sendEncryptedData(output, chunk, crypto)
 
                     bytesSent += read
                     chunkNum++
@@ -982,7 +1086,7 @@ class WePairingServer {
             sendEncryptedJson(output, DownloadInfo(
                 command = "transmissionContinue",
                 size = 0L,  // 0 means "transfer complete"
-            ))
+            ), crypto)
             WepWawetLogger.proxy("transferWallpaper COMPLETE",
                 "file" to fileName,
                 "bytes_sent" to bytesSent,
@@ -1082,7 +1186,14 @@ class WePairingServer {
 
         var heartbeatCount = 0
         var messageCount = 0
-        while (running && currentClient?.isConnected == true) {
+        // v0.7.24 (H-P4): `Socket.isConnected()` returns true for the
+        // LIFETIME of the socket once connect() returned — it does NOT
+        // reflect a silently-dead peer. isClosed() only turns true after WE
+        // close the socket locally, so the real exit signal is the read
+        // throwing (H-P5's read timeout guarantees that happens ≤65s after
+        // the peer goes silent). Combined condition: still running, client
+        // present, and not locally closed.
+        while (running && currentClient?.isClosed == false) {
             try {
                 val (kind, payload) = readMessageOrHeartbeat(input)
                 when (kind) {
@@ -1107,12 +1218,29 @@ class WePairingServer {
                         // recurring "Connection closed: java.net.
                         // SocketException: Socket closed" entries in the
                         // user's applog.
-                        try {
-                            sendEncryptedJsonString(output, """{"command":"heartbeat"}""")
-                        } catch (e: Exception) {
-                            WepWawetLogger.proxyWarn("Heartbeat echo failed",
-                                "exception" to e.javaClass.name)
-                            throw e
+                        // v0.7.24 (H-P6 BUG FIX): transferWallpaper holds
+                        // outputLock for the ENTIRE multi-chunk transfer, and
+                        // sendEncryptedJsonString synchronizes on the same
+                        // lock — so during a transfer the echo BLOCKED the
+                        // command loop for up to 30+s (100MB wallpaper),
+                        // delaying every other command. That defeated the
+                        // v0.5.32 "keep reading heartbeats" fix. The transfer
+                        // chunks THEMSELVES reset the phone's 5s idle timer
+                        // (TransferService treats each received frame as
+                        // activity), so skipping the echo during a transfer
+                        // is safe AND keeps the loop responsive.
+                        if (transferInProgress.get()) {
+                            if (heartbeatCount % 10 == 1) {
+                                WepWawetLogger.proxy("Heartbeat echo skipped — transfer in progress (chunks keep the phone's idle timer re-armed)")
+                            }
+                        } else {
+                            try {
+                                sendEncryptedJsonString(output, """{"command":"heartbeat"}""")
+                            } catch (e: Exception) {
+                                WepWawetLogger.proxyWarn("Heartbeat echo failed",
+                                    "exception" to e.javaClass.name)
+                                throw e
+                            }
                         }
                         // v0.5.32 (audit C4): Spawn the transfer on a
                         // separate thread so this loop can keep READING

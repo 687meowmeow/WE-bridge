@@ -241,7 +241,10 @@ fun WorkshopBrowserScreen(
     // value), but we initialize it from the repo and write back to the repo
     // on every change.
     val repoQuery by repo.searchQueryText.collectAsState()
-    var query by remember { mutableStateOf(repoQuery) }
+    // v0.7.24 (M-U8): rememberSaveable — the search text was lost on every
+    // configuration change (rotation) because plain remember is discarded
+    // with the Activity.
+    var query by rememberSaveable { mutableStateOf(repoQuery) }
     // Sync local state when the repo's query changes (e.g., after navigation
     // back, or after clearSearch was called from elsewhere — sort/tag change
     // LaunchedEffect below calls repo.clearSearch() which clears the repo
@@ -1027,7 +1030,7 @@ fun WorkshopBrowserScreen(
                         )
                         OutlinedTextField(
                             value = jumpPageText,
-                            onValueChange = { if (it.all { c -> c.isDigit() }) jumpPageText = it },
+                            onValueChange = { if (it.all { c -> c.isDigit() }) jumpPageText = it.take(6) }, // L-U12: cap at 6 digits
                             placeholder = { Text("page #", style = MaterialTheme.typography.labelSmall) },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(

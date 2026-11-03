@@ -247,7 +247,12 @@ object AviToMp4Transcoder {
                 }
             }
         }
-        return encoder.finish()
+        // v0.7.24 (H-V1): finish() false → no valid MP4 was produced.
+        if (!encoder.finish()) {
+            runCatching { outputFile.delete() }
+            return false
+        }
+        return true
     }
 
     // ── compressed: H.264 / MPEG-4 Part 2 via MediaCodec ─────────────────
@@ -273,11 +278,27 @@ object AviToMp4Transcoder {
         // Decode → ARGB → re-encode. YUV plane strides come from the
         // decoder's output Image, so vendor layouts are handled correctly.
         val decoder = try {
-            MediaCodec.createDecoderByType(mime)
+            MediaCodec.createDecoderByType(mime).apply {
+                // v0.7.24 (C-V1 BUG FIX): the codec was created but NEVER
+                // configured or started — dequeueInputBuffer requires the
+                // Running sub-state and threw IllegalStateException on the
+                // very first loop iteration, so EVERY compressed-AVI
+                // wallpaper (H.264/XVID/DX50/DIVX/MP4V) silently failed the
+                // on-device transcode. Configure with the stream's real
+                // dimensions (abs() — the AVI height is negative for
+                // top-down bitmaps) and start.
+                val decFormat = MediaFormat.createVideoFormat(
+                    mime, video.width, Math.abs(video.height))
+                configure(decFormat, null, null, 0)
+                start()
+            }
         } catch (e: Exception) {
-            WepWawetLogger.proxyError("$TAG: cannot create decoder",
+            WepWawetLogger.proxyError("$TAG: cannot create/configure/start decoder",
                 "mime" to mime,
-                "exception" to e.javaClass.name)
+                "width" to video.width,
+                "height" to Math.abs(video.height),
+                "exception" to e.javaClass.name,
+                "message" to (e.message ?: ""))
             return false
         }
 

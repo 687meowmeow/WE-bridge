@@ -341,11 +341,21 @@ class SteamLoginActivity : ComponentActivity() {
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
         /**
-         * Launch the Steam login activity. The caller receives the result via
-         * `registerForActivityResult(StartActivityForResult()) { ... }`.
+         * Launch the Steam login activity.
+         *
+         * v0.7.24 (H-A1): this uses the DEPRECATED
+         * [Activity.startActivityForResult] — a caller using
+         * `registerForActivityResult(StartActivityForResult())` will NOT
+         * receive a callback (the two mechanisms are mutually exclusive; the
+         * old KDoc claimed the opposite). There are currently no call sites;
+         * if you need the result, use
+         * `startActivity(Intent(context, SteamLoginActivity::class.java))`
+         * from an ActivityResultLauncher and read the result extras
+         * ([EXTRA_RESULT_SUCCESS] / [EXTRA_RESULT_COOKIES] /
+         * [EXTRA_RESULT_STEAM_ID]) in the launcher callback.
          *
          * @param caller the launching activity
-         * @param requestCode request code for legacy [Activity.startActivityForResult]
+         * @param requestCode request code for the legacy [Activity.startActivityForResult]
          */
         fun launch(caller: Activity, requestCode: Int = 1001) {
             WepWawetLogger.lifecycle("SteamLoginActivity.launch",

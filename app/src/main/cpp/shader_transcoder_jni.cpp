@@ -1,9 +1,11 @@
 /*
  * shader_transcoder_jni.cpp — JNI wrapper for glslang + SPIRV-Cross.
  *
- * v0.6.0 (parity §7-1): This file is now MANDATORY at build time (CMakeLists.txt
- * hard-errors if glslang+SPIRV-Cross aren't available). Previously it was
- * optional, breaking HLSL→GLSL conversion when FetchContent failed.
+ * v0.6.0 (parity §7-1): glslang + SPIRV-Cross are fetched via CMake
+ * FetchContent; if the fetch fails, CMakeLists.txt only logs a WARNING and
+ * this TU compiles to a stub (GLSLANG_AVAILABLE undefined) — the Kotlin
+ * caller (ShaderTranscoder.transcodeShader) then falls back to the regex
+ * path. (v0.7.24, L-N1/L-S12: corrected the stale "hard-errors" comment.)
  *
  * v0.6.0 (parity §7-2): Supports ALL shader stages (vertex, fragment, geometry,
  * hull, domain, compute). Previously only vertex + fragment were supported,
@@ -17,9 +19,28 @@
  * to GLSL ES 3.00 via SPIRV-Cross's C++ API.
  */
 
+#include <jni.h>
+
+/*
+ * v0.7.24 (H-S2): Availability probe compiled UNCONDITIONALLY (outside the
+ * GLSLANG_AVAILABLE guard). The Kotlin-side `isLoaded` only proves that
+ * libwepwawet_etc2.so loaded — NOT that glslang+SPIRV-Cross were fetched at
+ * build time. When they weren't, every transcodeShader call entered the JNI
+ * path just to throw UnsatisfiedLinkError. This probe lets isAvailable()
+ * report the truth so callers can pick the regex fallback up front.
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_wepwawet_pairing_ShaderTranscoder_nativeIsAvailable(
+        JNIEnv* /*env*/, jclass /*clazz*/) {
+#ifdef GLSLANG_AVAILABLE
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
 #ifdef GLSLANG_AVAILABLE
 
-#include <jni.h>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -53,15 +74,23 @@
 
 class WepWawetIncluder : public glslang::TShader::Includer {
 public:
-    // Result struct used by glslang
+    // Result struct used by glslang.
+    // v0.7.24 (C-S2 BUG FIX): the base-class `headerName` pointer was left
+    // pointing at the CALLER's local `name` std::string — destroyed as soon
+    // as includeLocal() returned. glslang reads headerName after the call
+    // (diagnostics, line directives, include stack) — a dangling-pointer
+    // read. Both the name and the content are now owned copies.
     struct IncludeResultImpl : public IncludeResult {
+        std::string name_owned;
         std::string content_owned;
         IncludeResultImpl(const std::string& name, const std::string& content)
-            : IncludeResult(name.c_str(), content.c_str(), content.size(), nullptr),
+            : IncludeResult(nullptr, nullptr, 0, nullptr),
+              name_owned(name),
               content_owned(content) {
-            // Reset the data pointer to the owned string's data
-            static_cast<IncludeResult*>(this)->headerData = content_owned.c_str();
-            static_cast<IncludeResult*>(this)->headerLength = content_owned.size();
+            IncludeResult* base = static_cast<IncludeResult*>(this);
+            base->headerName = name_owned.c_str();
+            base->headerData = content_owned.c_str();
+            base->headerLength = content_owned.size();
         }
     };
 
@@ -133,13 +162,15 @@ public:
 
 extern "C" {
 
-// Initialize glslang (must be called once before any compilation)
-static bool glslangInitialized = false;
+// v0.7.24 (C-S3 BUG FIX): glslang::InitializeProcess must run EXACTLY once
+// per process; concurrent first-calls from two threads corrupted the glslang
+// global pool (plain bool had no synchronization). std::call_once is the
+// canonical fix.
+static std::once_flag g_glslang_once;
 static void ensureGlslangInit() {
-    if (!glslangInitialized) {
+    std::call_once(g_glslang_once, []() {
         glslang::InitializeProcess();
-        glslangInitialized = true;
-    }
+    });
 }
 
 /*
@@ -222,8 +253,14 @@ Java_com_wepwawet_pairing_ShaderTranscoder_nativeTranscodeShader(
     }
 
     // Generate SPIR-V
+    // v0.7.24 (M-N6): getIntermediate can return null (e.g. when the link
+    // step didn't produce the requested stage) — dereferencing it was UB.
     std::vector<unsigned int> spirv;
-    glslang::GlslangToSpv(*program.getIntermediate(stage), spirv);
+    const glslang::TIntermediate* intermediate = program.getIntermediate(stage);
+    if (intermediate == nullptr) {
+        return nullptr;
+    }
+    glslang::GlslangToSpv(*intermediate, spirv);
     if (spirv.empty()) {
         return nullptr;
     }
@@ -235,7 +272,11 @@ Java_com_wepwawet_pairing_ShaderTranscoder_nativeTranscodeShader(
     options.version = 300;       // GLSL ES 3.00
     options.es = true;           // ES profile
     options.vulkan_semantics = false;  // Use GL semantics (not Vulkan)
-    compiler.set_options(options);
+    // v0.7.24 (H-S3): the setter is set_common_options (there is no public
+    // set_options on CompilerGLSL — this TU failed to compile whenever
+    // GLSLANG_AVAILABLE was defined, which is why the races above never
+    // manifested in shipped builds).
+    compiler.set_common_options(options);
 
     std::string glslResult;
     try {
@@ -254,6 +295,12 @@ Java_com_wepwawet_pairing_ShaderTranscoder_nativeTranscodeShader(
     if (result != nullptr) {
         env->SetByteArrayRegion(result, 0, resultLen,
             reinterpret_cast<const jbyte*>(glslResult.c_str()));
+        // v0.7.24 (M-N2): if SetByteArrayRegion raised (e.g. array was mutated
+        // concurrently), do NOT keep executing native code with a pending
+        // exception — return the (safe) null result immediately.
+        if (env->ExceptionCheck()) {
+            return nullptr;
+        }
     }
 
     return result;

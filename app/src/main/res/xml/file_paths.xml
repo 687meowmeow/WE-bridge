@@ -1,22 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- v0.7.24 (H-A7 + H-A8): every declared path now matches a directory the
+     app ACTUALLY writes to. The old set (mpkg-outbox/, workshop-cache/,
+     logs/, wine-prefix/) matched nothing — no code ever wrote to any of
+     them, and getUriForFile was never called, making the provider fully
+     dead. Real locations:
+       - files/wepwawet/logs/     (LogPersistenceWorker daily logs)
+       - files/wepwawet/crashes/  (CrashHandler reports)
+       - cache workshop_downloads/ (downloaded .pkg content pre-pack) -->
 <paths>
-    <!-- .mpkg outbox: emulated WE writes .mpkg files here, our proxy serves them -->
-    <files-path
-        name="mpkg-outbox"
-        path="mpkg-outbox/" />
-
-    <!-- Workshop content cache (the downloaded .pkg files) -->
-    <files-path
-        name="workshop-cache"
-        path="workshop-cache/" />
-
-    <!-- Logs (for log-sharing intent) -->
+    <!-- Persistent logs (for a future log-share intent) -->
     <files-path
         name="logs"
-        path="logs/" />
+        path="wepwawet/logs/" />
 
-    <!-- Wine prefix internal files (rarely needed but useful for debugging) -->
+    <!-- Crash reports (H-A8: attach to a share intent) -->
+    <files-path
+        name="crashes"
+        path="wepwawet/crashes/" />
+
+    <!-- Downloaded workshop content cache -->
     <cache-path
-        name="wine-prefix"
-        path="wine-prefix/" />
+        name="workshop-downloads"
+        path="workshop_downloads/" />
 </paths>

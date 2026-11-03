@@ -9,6 +9,12 @@
 -keep class com.wepwawet.pairing.** { *; }
 -keep class com.wepwawet.data.model.** { *; }
 -keep class com.wepwawet.data.api.** { *; }
+# v0.7.24 (C-D5 BUG FIX): DownloadProgress + CompletedDownload live in
+# com.wepwawet.data TOP-LEVEL (DownloadManager.kt) — NOT in .model/.api, so
+# R8 renamed their fields in release builds and Gson silently round-tripped
+# EMPTY objects: every completed-download history entry lost its metadata on
+# app restart. Keep the whole package.
+-keep class com.wepwawet.data.** { *; }
 -keep class com.google.gson.** { *; }
 -keepattributes Signature
 -keepattributes *Annotation*

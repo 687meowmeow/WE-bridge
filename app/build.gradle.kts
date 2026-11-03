@@ -499,8 +499,69 @@ android {
         //     CancellationException.
         //   - BUG PS-1: notificationDeletedReceiver Handler + Runnable hoisted
         //     to fields, removed in onDestroy (500ms leak fix).
-        versionCode = 115
-        versionName = "0.7.23-alpha"
+        // v0.7.24-alpha: audit-driven correctness + security pass (~40 fixes from
+        // the 220-finding external audit; every Critical and High verified real
+        // and fixed, false positives documented in the commit message).
+        //   NATIVE (C-N1..C-N5, H-N1..H-N4, M-N3, M-N4): use1BitAlpha flag was
+        //     INVERTED at the JNI boundary (every DXT1a texture shipped with
+        //     opaque-black alpha); BC7/BC6H decoders were structurally wrong
+        //     (bogus weight tables, 4-of-64 partitions, no delta endpoints) —
+        //     replaced with the vendored bcdec.h (MIT) which implements the
+        //     Khronos spec bit-exactly; 32-bit overflow + std::bad_alloc UB at
+        //     the JNI boundary in all three encoders; -ffunction-sections/
+        //     --gc-sections + NDEBUG now release-only.
+        //   SHADER (C-S1..C-S4, H-S1..H-S7): swizzle index table misclassified
+        //     g/b (re-introduced the link failure the pass prevents); dangling
+        //     headerName in the glslang Includer; glslang init race; missing
+        //     set_common_options (TU never compiled); StackOverflowError escape;
+        //     precision-qualified uniform dedup; ++/-- span; unbalanced-brace
+        //     detection; lexer-failure discarding rewrites; RGBA size overflow.
+        //   PAIRING (C-P2, C-P3, H-P1..H-P8, M-P8): transfer crypto now uses an
+        //     immutable session snapshot (new pairing could corrupt in-flight
+        //     transfer); PIN fully redacted from logs; startForeground failure
+        //     stops cleanly (no restart loop); ACTION_KILL stopForeground guard;
+        //     background timeout driven by ProcessLifecycleOwner; command-loop
+        //     read timeout 65s (dead-peer detection); heartbeat echo skipped
+        //     during transfers (outputLock no longer blocks the loop 30+s);
+        //     broadcaster isRunning reset; connection cap; Android-15 two-arg
+        //     onTimeout.
+        //   CREDENTIALS (C-P4, M-P2): Steam password + refresh token migrated
+        //     to EncryptedSharedPreferences with transparent plaintext
+        //     migration and loud fallback.
+        //   DOWNLOAD (C-D1..C-D5, H-D2, H-D6..H-D9): per-owner abort callbacks
+        //     keyed by workshopId (concurrent downloads aborted each other);
+        //     authPollingThread joined on reconnect; cancellable wait loop
+        //     (Thread.sleep → delay); CancellationException re-throw;
+        //     ProGuard keep for com.wepwawet.data (R8 broke download history);
+        //     volatile completionException; job-map cleanup; WhileSubscribed
+        //     flows; LRU detail cache; legacy mirror no longer flickers.
+        //   VIDEO (C-V1..C-V4, H-V1..H-V8): AVI decoder never configured/
+        //     started (EVERY compressed-AVI wallpaper failed); audio encoder
+        //     hardcoded 44.1kHz stereo (wrong speed/pitch); BitmapToMp4
+        //     EOS-queue retry + drain cap; orphaned encoder buffers returned;
+        //     .mp4 sniffed for AVC before copy; level selected by resolution;
+        //     HEVC configure fallback to AVC; sliceHeight padding zeroed;
+        //     VideoTrimmer sample buffer grows past 1MB; AVI partial outputs
+        //     deleted.
+        //   MPKG (C-M1, C-M2, H-M1): LZ4 header rewritten on decompress (stale
+        //     IsLz4=1 corrupted re-parse); pack() cursor Long + u32 guard;
+        //     magic validated before the stream is written.
+        //   UI/APP (C-U1..C-U4, H-U2..H-U8, C-A1..C-A5, H-A2, H-A4): ExoPlayer
+        //     paused on background; main-thread MediaStore walks moved to IO;
+        //     per-item download flows (no more whole-grid recomposition);
+        //     rememberSaveable grid states; URLDecoder guarded; composition
+        //     logging moved to LaunchedEffect; appScope exception handler;
+        //     super.onCreate() ordering; CrashHandler latch (no shared
+        //     StringBuilder); batched log persistence (no 5000 fsyncs);
+        //     atomic snapshot+watermark; crash-latest MediaStore row deleted;
+        //     findFile scoped to our subdirectory; file_paths.xml matches
+        //     reality.
+        //   CI (H-B1): NDK + CMake pinned in the workflow.
+        //   Filmstrip (user request): rotation-corrected aspect ratio, contiguous
+        //     frames (no 1dp gaps), duration-based frame count (1 per 2s,
+        //     48..120), null-frame reuse, always-rendered background.
+        versionCode = 116
+        versionName = "0.7.24-alpha"
         // Native ABI filter — only build for arm64-v8a (WE app targets Snapdragon 8 Gen 2+)
         ndk {
             abiFilters += "arm64-v8a"

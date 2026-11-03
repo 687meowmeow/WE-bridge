@@ -48,6 +48,7 @@ import com.wepwawet.pairing.WorkshopBrowseSession
 import com.wepwawet.pairing.WorkshopDownloader
 import com.wepwawet.ui.components.SlimTopBar
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * SharedPreferences file used by the Settings screen for persisting user
@@ -828,15 +829,25 @@ private fun AboutCard() {
 private fun CacheCard(context: Context) {
     var cacheSize by remember { mutableStateOf(0L) }
     var cleared by remember { mutableStateOf(false) }
+    // v0.7.24 (C-U3): the clear operation now runs on Dispatchers.IO — the
+    // walk + deletes of hundreds of .pkg files blocked the main thread for
+    // seconds. Show a spinner while it runs and disable the button.
+    var clearInProgress by remember { mutableStateOf(false) }
+    val clearScope = rememberCoroutineScope()
 
     // Compute cache size
+    // v0.7.24 (C-U4 BUG FIX): walkTopDown() ran on the LaunchedEffect's MAIN
+    // dispatcher — on a cache with hundreds of .pkg files (10-100MB each) the
+    // directory walk blocked composition for a visible jank burst. IO now.
     LaunchedEffect(cleared) {
         cacheSize = try {
-            var size = 0L
-            context.cacheDir.walkTopDown().forEach { f ->
-                if (f.isFile) size += f.length()
+            withContext(kotlinx.coroutines.Dispatchers.IO) {
+                var size = 0L
+                context.cacheDir.walkTopDown().forEach { f ->
+                    if (f.isFile) size += f.length()
+                }
+                size
             }
-            size
         } catch (_: Exception) { 0L }
     }
 
@@ -860,8 +871,12 @@ private fun CacheCard(context: Context) {
             )
             Spacer(Modifier.height(12.dp))
             Button(
+                enabled = !clearInProgress,
                 onClick = {
+                    if (clearInProgress) return@Button
                     WepWawetLogger.appInfo("settings_clear_cache_clicked")
+                    clearInProgress = true
+                    clearScope.launch(kotlinx.coroutines.Dispatchers.IO) {
                     try {
                         // v0.7.21 BUG FIX: Skip files that are actively being
                         // written by in-flight downloads. Deleting these causes
@@ -905,11 +920,14 @@ private fun CacheCard(context: Context) {
                     } catch (e: Exception) {
                         WepWawetLogger.appInfo("settings_clear_cache_failed",
                             "exception" to e.javaClass.name)
+                    } finally {
+                        clearInProgress = false
+                    }
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Clear Cache")
+                Text(if (clearInProgress) "Clearing…" else "Clear Cache")
             }
         }
     }

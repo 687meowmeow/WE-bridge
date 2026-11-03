@@ -100,7 +100,10 @@ object WepWawetLogger {
     private val initLock = Any()
 
     // v0.7.4: kept so clear() can reset the persistence watermark — see clear().
-    private var appContextRef: Context? = null
+    // v0.7.24 (BUG 31 from v0.7.22 audit): @Volatile — written under
+    // initLock but read without it in clear(); a reader thread could see a
+    // stale null even after init() completed.
+    @Volatile private var appContextRef: Context? = null
 
     fun init(context: Context) {
         synchronized(initLock) {
@@ -267,13 +270,35 @@ object WepWawetLogger {
      * watermark to 0 as part of the clear (synchronously via commit()).
      */
     fun clear() {
-        synchronized(ringBuffer) { ringBuffer.clear(); seq.set(0) }
-        runCatching {
-            appContextRef?.getSharedPreferences(
-                "wepwawet_log_persistence", Context.MODE_PRIVATE)
-                ?.edit()?.putLong("last_seq", 0L)?.commit()
+        // v0.7.24 (C-A5): the watermark reset moved INSIDE the ring-buffer
+        // monitor so a concurrent snapshotWithWatermark() can never observe
+        // "pre-clear snapshot + post-clear watermark" (or the reverse) —
+        // that interleaving made the persistence worker re-write the ENTIRE
+        // pre-clear buffer to disk. commit() while holding the monitor is
+        // safe: snapshot() callers only block for the duration of one
+        // prefs commit (a few ms), and clear() is a rare user action.
+        synchronized(ringBuffer) {
+            ringBuffer.clear()
+            seq.set(0)
+            runCatching {
+                appContextRef?.getSharedPreferences(
+                    "wepwawet_log_persistence", Context.MODE_PRIVATE)
+                    ?.edit()?.putLong("last_seq", 0L)?.commit()
+            }
         }
     }
+
+    /**
+     * v0.7.24 (C-A5): atomically read the current snapshot together with the
+     * persistence watermark. Holding the ring-buffer monitor across BOTH
+     * reads means a clear() (which resets the watermark under the same
+     * monitor) either fully precedes or fully follows this call — the
+     * snapshot and the watermark can never disagree.
+     */
+    fun snapshotWithWatermark(prefs: android.content.SharedPreferences): Pair<List<LogEntry>, Long> =
+        synchronized(ringBuffer) {
+            ringBuffer.toList() to prefs.getLong("last_seq", 0L)
+        }
 
     fun drainTo(target: MutableList<LogEntry>): Int = synchronized(ringBuffer) {
         val count = ringBuffer.size

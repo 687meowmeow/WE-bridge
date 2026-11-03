@@ -1,7 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <!-- Steam credentials must never back up -->
-    <exclude domain="sharedpref" path="steam_credentials.xml" />
+    <!-- v0.7.24 (M-A1): the actual prefs file is wepwawet_steam_credentials.xml
+         (PREF_NAME in SteamCredentialsStore) — the old exclude targeted a
+         non-existent filename. The refresh-token file is excluded too. -->
+    <exclude domain="sharedpref" path="wepwawet_steam_credentials.xml" />
+    <exclude domain="sharedpref" path="wepwawet_steam_credentials_secure.xml" />
+    <exclude domain="sharedpref" path="wepwawet_steam_token.xml" />
+    <exclude domain="sharedpref" path="wepwawet_steam_token_secure.xml" />
+    <exclude domain="sharedpref" path="wepwawet_steam_cookies.xml" />
     <!-- Box64 DynaCache is regenerable -->
     <exclude domain="file" path="box64-cache/" />
     <!-- Logs are huge and don't need to back up -->

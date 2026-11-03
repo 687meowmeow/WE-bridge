@@ -18,9 +18,11 @@ import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
 import com.wepwawet.log.CrashHandler
 import com.wepwawet.log.WepWawetLogger
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.File
 
 /**
@@ -96,9 +98,32 @@ class WepWawetApplication : Application(), Configuration.Provider, ImageLoaderFa
         // CrashHandler that wants to log via a coroutine) would crash on
         // boot with no obvious cause. Moving appScope init to the very
         // first line of onCreate eliminates the risk.
-        appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        // v0.7.24 (H-U8 BUG FIX): super.onCreate() must run FIRST — it
+        // initializes ContentProviders (including WorkManager's default
+        // initializer); any provider's onCreate that touched
+        // WepWawetApplication.instance hit an
+        // UninitializedPropertyAccessException because instance was assigned
+        // only after the CrashHandler block. Field inits that must precede
+        // super.onCreate() (nothing does, per audit) stay after it.
+        super.onCreate()
 
-        // Set singleton instance FIRST (before anything else might need it)
+        appScope = CoroutineScope(
+            SupervisorJob() + Dispatchers.IO +
+                // v0.7.24 (H-U7): uncaught exceptions in appScope children
+                // (e.g. a WorkshopDownloadJob packing NPE) propagate to the
+                // thread's UncaughtExceptionHandler and CRASH the app from
+                // the background. A logged handler keeps the process alive.
+                CoroutineExceptionHandler { _, t ->
+                    Log.e(TAG, "Uncaught exception in appScope", t)
+                    runCatching {
+                        com.wepwawet.log.WepWawetLogger.appError(
+                            "Uncaught exception in appScope",
+                            exception = t)
+                    }
+                }
+        )
+
+        // Set singleton instance (after super.onCreate — see H-U8).
         instance = this
 
         // Step 1: Install crash handler FIRST so we never miss a crash from the rest of onCreate.
@@ -110,10 +135,16 @@ class WepWawetApplication : Application(), Configuration.Provider, ImageLoaderFa
             Log.e(TAG, "CrashHandler.install failed", t)
         }
 
-        super.onCreate()
-
         // v0.6.1: Load persisted download history from SharedPreferences
-        com.wepwawet.data.DownloadManager.initialize(this)
+        // v0.7.24 (C-A1 BUG FIX): wrapped — the class KDoc promises every step
+        // is independently try-caught, but this call was bare: one throw and
+        // the logger init / notification channels / breadcrumb never ran,
+        // booting the app half-initialized.
+        runCatching {
+            com.wepwawet.data.DownloadManager.initialize(this)
+        }.onFailure { t ->
+            Log.e(TAG, "DownloadManager.initialize failed", t)
+        }
 
         // v0.7.4: load the user's page-size setting into SteamApiService so the
         // "Page size" slider in Settings actually affects queries (it was
@@ -129,10 +160,21 @@ class WepWawetApplication : Application(), Configuration.Provider, ImageLoaderFa
         // this file is missing, the crash is happening BEFORE Application.onCreate
         // (which means class-loading failure, manifest merge issue, or native
         // init crash — none of which the Java CrashHandler can capture).
-        runCatching {
-            writeBootBreadcrumb()
-        }.onFailure { t ->
-            Log.e(TAG, "writeBootBreadcrumb failed", t)
+        //
+        // v0.7.24 (C-U2 BUG FIX): writeBootBreadcrumb does a MediaStore
+        // query + insert + openOutputStream + write — IPC to MediaProvider
+        // that can block for hundreds of ms under load, all on the MAIN
+        // thread inside onCreate (ANR on slow devices). Hop to the IO
+        // dispatcher (appScope was created above); the write is best-effort
+        // and its ordering vs. the later appendToBootBreadcrumb calls is
+        // preserved by writing the "onCreate complete" line through the
+        // same scope below.
+        appScope.launch {
+            runCatching {
+                writeBootBreadcrumb()
+            }.onFailure { t ->
+                Log.e(TAG, "writeBootBreadcrumb failed", t)
+            }
         }
 
         // Step 3: Initialize the logger. If this fails, we can't use WepWawetLogger
@@ -176,8 +218,11 @@ class WepWawetApplication : Application(), Configuration.Provider, ImageLoaderFa
         }
 
         // Final breadcrumb: confirm we got to the end of onCreate
-        runCatching {
-            appendToBootBreadcrumb("onCreate complete\n")
+        // (v0.7.24, C-U2: same IO scope as the initial breadcrumb write.)
+        appScope.launch {
+            runCatching {
+                appendToBootBreadcrumb("onCreate complete\n")
+            }
         }
         // NOTE: appScope was initialized at the TOP of onCreate (audit M4).
         // The old init at this point has been removed.
@@ -328,10 +373,13 @@ class WepWawetApplication : Application(), Configuration.Provider, ImageLoaderFa
      * WorkManager Configuration — uses our explicit min-shred-logging initializer
      * (we don't want WorkManager's default to spam logcat).
      */
-    override val workManagerConfiguration: Configuration
-        get() = Configuration.Builder()
+    // v0.7.24 (M-U19): cached — the getter built a new Configuration on
+    // every access (WorkManager reads it multiple times at init).
+    override val workManagerConfiguration: Configuration by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        Configuration.Builder()
             .setMinimumLoggingLevel(Log.INFO)
             .build()
+    }
 
     companion object {
         private const val TAG = "WepWawet-App"
@@ -344,7 +392,9 @@ class WepWawetApplication : Application(), Configuration.Provider, ImageLoaderFa
          * MpkgPacker.texCacheLookup/texCacheStore to access cacheDir
          * without passing Context through the call chain.
          */
-        lateinit var instance: WepWawetApplication
+        // v0.7.24 (M-U18): @Volatile — readers on other threads (native
+        // upcall, binder thread) must observe the write from onCreate.
+        @Volatile lateinit var instance: WepWawetApplication
             private set
 
         /**

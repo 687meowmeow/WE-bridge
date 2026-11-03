@@ -632,8 +632,13 @@ object ShaderEsslSafety {
     private fun declareMissingEngineUniforms(content: String): Pair<String, List<String>> {
         val notes = ArrayList<String>()
         var out = content
+        // v0.7.24 (H-S1 BUG FIX): the detection regex required a BARE
+        // `uniform vec4 g_PointerState;` — a pre-existing precision-qualified
+        // declaration (`uniform lowp/mediump/highp vec4 …`) did NOT match,
+        // so the pass inserted a SECOND declaration → ESSL redefinition
+        // error. The regex now accepts an optional precision qualifier.
         if (Regex("""\bg_PointerState\b""").containsMatchIn(out) &&
-            !Regex("""uniform[ \t]+vec4[ \t]+g_PointerState[ \t]*;""").containsMatchIn(out)) {
+            !Regex("""uniform[ \t]+(?:lowp|mediump|highp[ \t]+)?vec4[ \t]+g_PointerState[ \t]*;""").containsMatchIn(out)) {
             out = "uniform vec4 g_PointerState;\n" + out
             notes.add("declared missing uniform vec4 g_PointerState")
         }
@@ -651,16 +656,30 @@ object ShaderEsslSafety {
         val (declared, declareNotes) = declareMissingEngineUniforms(deduped)
         val (renamed, renameNotes) = renameReservedIdentifiers(declared)
         val hoisted = blurIncludeHoist(renamed)
-        val toks = lex(hoisted) ?: return content to emptyList()
-        val edits = ArrayList<Edit>()
         val notes = ArrayList<String>(callNotes + shadowNotes + dedupeNotes + declareNotes + renameNotes)
         if (hoisted !== renamed) notes.add("blur-include hoist @char${BLUR_INCLUDE_LINE.find(renamed)?.range?.first}")
+        // v0.7.24 (H-S6 BUG FIX): when lex() fails on the hoisted source (an
+        // unterminated comment/string or a stray non-ASCII char), the old code
+        // returned the ORIGINAL `content` with an EMPTY report — silently
+        // discarding every prior rewrite (call replacement, shadow samplers,
+        // dedupe, declare-missing, rename, blur hoist). The string-level
+        // rewrites are still valid on `hoisted`; only the token-level edits
+        // are skipped. Return the hoisted source + the notes accumulated so far.
+        val toks = lex(hoisted) ?: return hoisted to (notes + listOf("lexer-failure: token-level passes skipped"))
+        val edits = ArrayList<Edit>()
         val code = toks.filter { it.kind != TKind.WS && it.kind != TKind.COMMENT }
 
         val p = ProgramParser(hoisted, toks, code, edits, notes)
         try {
             p.parseProgram()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // v0.7.24 (C-S4 BUG FIX): was `catch (e: Exception)`. The recursive
+            // descent parser has no depth limit — a shader with hundreds of
+            // nested parens/ternaries overflows the JVM stack, and
+            // StackOverflowError extends Error, NOT Exception, so it escaped
+            // this handler and crashed the process. Catching Throwable keeps
+            // the fail-safe "return the rewritten-so-far source" behavior.
+            notes.add("parser-failure (${e.javaClass.simpleName}): token-level edits skipped")
             return hoisted to notes
         }
         if (!p.balanced) return hoisted to notes
@@ -938,9 +957,16 @@ object ShaderEsslSafety {
                         return ERes(operand.ty, operandStart - 1, i - 1)
                     }
                     "++", "--" -> {
+                        // v0.7.24 (H-S4 BUG FIX): the old span was
+                        // `(i - 2, i - 1)` computed AFTER the operand — correct
+                        // only for a single-token operand. For `++x.y` the
+                        // start pointed at `y` instead of `++`, so outer wraps
+                        // inserted parens in the middle of the expression.
+                        // The operator index is captured BEFORE consuming it.
+                        val opIdx = i
                         i++
                         val operand = parseUnary()
-                        return ERes(operand.ty, i - 2, i - 1)
+                        return ERes(operand.ty, opIdx, i - 1)
                     }
                 }
             }
@@ -1532,7 +1558,18 @@ object ShaderEsslSafety {
             if (atP("{")) {
                 i++
                 parseBlockInner()
-                if (atP("}")) i++
+                if (atP("}")) {
+                    i++
+                } else {
+                    // v0.7.24 (H-S5 BUG FIX): parseBlockInner can also exit at
+                    // end-of-input when the function body's closing `}` is
+                    // missing. The old code popped the scope unconditionally,
+                    // so parseProgram's `scopes.isNotEmpty()` balanced-check
+                    // saw an EMPTY stack and treated the unbalanced source as
+                    // balanced — token edits recorded for the broken body were
+                    // then spliced in. Mark the program unbalanced instead.
+                    balanced = false
+                }
             } else {
                 skipToSemicolon()
             }

@@ -62,16 +62,34 @@ Java_com_wepwawet_pairing_EtcpackEncoder_nativeEncodeEtc2Rgba8(
 
     std::call_once(g_init_once, initEtcpack);
 
-    if (width <= 0 || height <= 0) {
+    // v0.7.24 (M-N1): every early-return error path now throws a proper Java
+    // exception — returning nullptr alone left the Kotlin caller unable to
+    // distinguish OOM from an encoder bug.
+    auto throwIllegalArg = [env](const char* msg) {
+        jclass exc = env->FindClass("java/lang/IllegalArgumentException");
+        if (exc != nullptr) env->ThrowNew(exc, msg);
+    };
+    auto throwOom = [env](const char* msg) {
+        jclass exc = env->FindClass("java/lang/OutOfMemoryError");
+        if (exc != nullptr) env->ThrowNew(exc, msg);
+    };
+    // v0.7.24 (C-N5): dimension guard — every size product below is computed
+    // in 32-bit arithmetic; >= 32769x32769 inputs overflowed the input-size
+    // check to 0 (bypassing it) and wrapped the malloc size to 0 (heap
+    // overflow in the row-copy loops). 16384 is the GLES3 texture-size floor.
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        throwIllegalArg("Invalid dimensions (expected 1..16384)");
         return nullptr;
     }
     const jsize srcLen = env->GetArrayLength(rgbaBytes);
-    if (srcLen < (jsize)(width * height * 4)) {
+    // v0.7.24 (C-N5): 64-bit input-size check (was 32-bit jint multiply).
+    if ((int64_t) srcLen < (int64_t) width * (int64_t) height * 4) {
+        throwIllegalArg("Input RGBA bytes too small for given dimensions");
         return nullptr;
     }
     jbyte *src = env->GetByteArrayElements(rgbaBytes, nullptr);
     if (src == nullptr) {
-        return nullptr;
+        return nullptr; // OOM already thrown by the JVM
     }
 
     // ── pad to multiples of 4 (FUN_1400598c0, align 4) ──
@@ -82,9 +100,12 @@ Java_com_wepwawet_pairing_EtcpackEncoder_nativeEncodeEtc2Rgba8(
     const uint32_t srcStride = w * 4;
     const uint32_t padStride = pw * 4;
 
-    uint8_t *padded = (uint8_t *) malloc((size_t) padStride * ph);
+    // v0.7.24 (C-N5): size_t multiply — `(size_t) padStride * ph` (both were
+    // 32-bit uint32_t; the product wrapped to 0 for pw=ph=32768).
+    uint8_t *padded = (uint8_t *) malloc((size_t) padStride * (size_t) ph);
     if (padded == nullptr) {
         env->ReleaseByteArrayElements(rgbaBytes, src, JNI_ABORT);
+        throwOom("native etcpack padded-buffer allocation failed");
         return nullptr;
     }
     for (uint32_t y = 0; y < h; y++) {
@@ -109,15 +130,25 @@ Java_com_wepwawet_pairing_EtcpackEncoder_nativeEncodeEtc2Rgba8(
     // ── encode every 4x4 block (FUN_1400da510 + FUN_140115ce0) ──
     const uint32_t blocksX = pw >> 2;
     const uint32_t blocksY = ph >> 2;
-    const jsize outLen = (jsize) blocksX * blocksY * 16;
+    // v0.7.24 (C-N5): 64-bit output-size math (16384^2/16 = 64M blocks * 16
+    // bytes = 1 GiB — fits jint, but compute safely anyway).
+    const int64_t outLen64 = (int64_t) blocksX * (int64_t) blocksY * 16;
+    if (outLen64 > 0x7FFFFFFFLL) {
+        free(padded);
+        throwIllegalArg("Output too large for a Java array");
+        return nullptr;
+    }
+    const jsize outLen = (jsize) outLen64;
     jbyteArray result = env->NewByteArray(outLen);
     if (result == nullptr) {
         free(padded);
-        return nullptr;
+        return nullptr; // OOM already thrown by the JVM
     }
     jbyte *out = env->GetByteArrayElements(result, nullptr);
     if (out == nullptr) {
         free(padded);
+        // v0.7.24 (M-N1): release the (empty) array reference path — the JVM
+        // already threw; nothing more to do.
         return nullptr;
     }
 

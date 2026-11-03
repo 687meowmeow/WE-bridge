@@ -97,8 +97,15 @@ object PublicDownloadsWriter {
     private fun findFile(context: Context, collection: Uri, displayName: String): Uri? {
         val resolver = context.contentResolver
         val projection = arrayOf(MediaStore.MediaColumns._ID)
-        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ?"
-        val args = arrayOf(displayName)
+        // v0.7.24 (H-A2 BUG FIX): the query filtered ONLY on DISPLAY_NAME — a
+        // file with the same name anywhere under Download/ (created by any
+        // other app, or the user) matched, and appendText then opened THAT
+        // foreign URI in "wa" mode and appended WepWawet's text to it,
+        // silently corrupting another app's file. Scope the query to OUR
+        // subdirectory (the same fix WepWawetApplication.findBootFile got).
+        val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND " +
+            "${MediaStore.MediaColumns.RELATIVE_PATH} = ?"
+        val args = arrayOf(displayName, "Download/$SUBDIR/")
         resolver.query(collection, projection, selection, args, null)?.use { c ->
             if (c.moveToFirst()) {
                 val id = c.getLong(0)

@@ -71,7 +71,6 @@ import com.wepwawet.pairing.PairingService
 import com.wepwawet.pairing.VideoTrimmer
 import com.wepwawet.ui.components.SlimTopBar
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -112,10 +111,12 @@ fun VideoTrimScreen(
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
 
-    val videoUri = remember { Uri.fromFile(videoFile).toString() }
+    val videoUri = remember(videoFile) { Uri.fromFile(videoFile).toString() }
 
     // ExoPlayer — preview loop of the video.
-    val player = remember {
+    // v0.7.24 (H-U6): keyed on videoUri so a changed file gets a fresh player
+    // (the old one is released by the DisposableEffect below).
+    val player = remember(videoUri) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(videoUri))
             prepare()
@@ -126,13 +127,35 @@ fun VideoTrimScreen(
     // v0.7.23 BUG VT-5: Recycle thumbnail bitmaps on dispose to prevent
     // native memory leak.
     val thumbnails = remember { mutableStateListOf<android.graphics.Bitmap>() }
-    DisposableEffect(Unit) {
+    DisposableEffect(videoUri) {
         onDispose {
             player.pause()
             player.release()
             thumbnails.forEach { runCatching { it.recycle() } }
             thumbnails.clear()
         }
+    }
+
+    // v0.7.24 (C-U1): pause playback when the app goes to the background
+    // (ExoPlayer keeps decoding + playing audio otherwise — battery drain +
+    // audio leak). Resume on return only if it was playing when we left.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    var wasPlayingBeforeBackground by remember { mutableStateOf(true) }
+    DisposableEffect(lifecycleOwner, player) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
+                    wasPlayingBeforeBackground = player.isPlaying
+                    player.pause()
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    if (wasPlayingBeforeBackground) player.play()
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     // Video metadata + trimmer state.
@@ -155,31 +178,57 @@ fun VideoTrimScreen(
                 val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
                 val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1920
                 val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 1080
+                // v0.7.24 BUG FIX: METADATA_KEY_VIDEO_WIDTH/HEIGHT return the
+                // PRE-ROTATION dimensions, but getFrameAtTime returns POST-ROTATION
+                // bitmaps. For a phone-recorded portrait video (1080x1920 stored as
+                // 1920x1080 + rotation=90), the frames were stretched into landscape
+                // boxes — "frames not to the aspect ratio". Swap w/h for 90/270
+                // rotation so both the preview AND the frame boxes use the displayed
+                // (rotated) aspect ratio.
+                val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ROTATION)?.toIntOrNull() ?: 0
+                val rotated = rotation == 90 || rotation == 270
+                val dispW = if (rotated) h else w
+                val dispH = if (rotated) w else h
                 durationMs = dur
                 endMs = dur
-                videoWidth = w
-                videoHeight = h
+                videoWidth = dispW
+                videoHeight = dispH
                 WepWawetLogger.workshop("VideoTrimScreen: metadata loaded",
-                    "duration_ms" to dur, "width" to w, "height" to h)
+                    "duration_ms" to dur, "width" to dispW, "height" to dispH,
+                    "rotation" to rotation)
 
                 // v0.7.21: Clear any stale thumbnails before regenerating.
                 thumbnails.forEach { runCatching { it.recycle() } }
                 thumbnails.clear()
 
-                val thumbCount = 40
+                // v0.7.24: Frame count is DURATION-BASED (one frame per 2 seconds,
+                // clamped to 48..120) — was a fixed 40 which was too coarse for
+                // long videos ("not enough frames"). frameCountFor() is shared
+                // with the layout so the strip geometry always matches.
+                val thumbCount = frameCountFor(dur)
+                val targetH = 160
+                val targetW = (targetH * dispW / dispH).toInt().coerceAtLeast(1)
+                // v0.7.24: reuse the LAST successfully-decoded (scaled) bitmap when
+                // getFrameAtTime returns null (common at the very end of the video
+                // and for exotic codecs) — keeps thumbnails.size == frameCount so
+                // the strip geometry never drifts from the overlay math.
+                var lastScaled: android.graphics.Bitmap? = null
                 for (i in 0 until thumbCount) {
-                    val t = if (thumbCount > 1) dur * i / (thumbCount - 1) else 0
-                    val bmp = retriever.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    if (bmp != null) {
-                        val targetH = 160
-                        val targetW = (targetH * w / h).toInt().coerceAtLeast(1)
-                        val scaled = android.graphics.Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
-                        if (scaled != bmp) bmp.recycle()
-                        thumbnails.add(scaled)
-                    }
+                    // v0.7.24: t = dur * i / thumbCount keeps t < dur (was
+                    // dur * i / (thumbCount - 1) which hits exactly dur at the last
+                    // frame — getFrameAtTime(duration) often returns null there).
+                    val t = dur * i / thumbCount
+                    val raw = retriever.getFrameAtTime(t * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    val src = raw ?: lastScaled
+                    if (src == null) continue
+                    val scaled = android.graphics.Bitmap.createScaledBitmap(src, targetW, targetH, true)
+                    if (raw != null && scaled !== raw) raw.recycle()
+                    thumbnails.add(scaled)
+                    lastScaled = scaled
                 }
                 WepWawetLogger.workshop("VideoTrimScreen: thumbnails generated",
-                    "count" to thumbnails.size)
+                    "count" to thumbnails.size,
+                    "requested" to thumbCount)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -206,10 +255,14 @@ fun VideoTrimScreen(
         16f / 9f
     }
 
-    // v0.7.23: Filmstrip dimensions. Bigger clip bar thumbs (48dp touch target).
+    // v0.7.24: Filmstrip dimensions. frameWidth is derived from the DISPLAYED
+    // (rotation-corrected) aspect ratio so each frame box exactly matches the
+    // decoded thumbnail's proportions. Frames are CONTIGUOUS (no spacedBy gaps)
+    // so totalStripWidthDp == frameCount * frameWidthDp EXACTLY — the overlay /
+    // clip-bar / playhead positions can never drift from the frames.
     val filmstripHeight = 80.dp
     val frameWidthDp = filmstripHeight * aspectRatio
-    val frameCount = 40
+    val frameCount = frameCountFor(durationMs)
     val totalStripWidthDp = frameWidthDp * frameCount
     val filmstripScrollState = rememberScrollState()
     val totalStripWidthPx = with(density) { totalStripWidthDp.toPx() }
@@ -317,34 +370,31 @@ fun VideoTrimScreen(
                             .fillMaxSize()
                             .horizontalScroll(filmstripScrollState),
                     ) {
-                        // 1) Thumbnail strip background
-                        if (thumbnails.isNotEmpty()) {
-                            Row(
-                                modifier = Modifier
-                                    .width(totalStripWidthDp)
-                                    .fillMaxHeight(),
-                                horizontalArrangement = Arrangement.spacedBy(1.dp),
-                            ) {
-                                thumbnails.forEach { bmp ->
-                                    Image(
-                                        bitmap = bmp.asImageBitmap(),
-                                        contentDescription = null,
-                                        contentScale = ContentScale.FillBounds,
-                                        modifier = Modifier
-                                            .width(frameWidthDp)
-                                            .fillMaxHeight(),
-                                    )
-                                }
-                            }
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .width(totalStripWidthDp)
-                                    .fillMaxHeight()
-                                    .background(Color.DarkGray),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        // 1) Dark strip background — ALWAYS rendered (frames load
+                        //    progressively on top of it), full strip width.
+                        Box(
+                            modifier = Modifier
+                                .width(totalStripWidthDp)
+                                .fillMaxHeight()
+                                .background(Color(0xFF202020)),
+                        )
+                        // 1b) Thumbnail strip — v0.7.24: contiguous (no spacedBy
+                        //     gaps) so the geometry matches totalStripWidthDp
+                        //     exactly; each Image is frameWidthDp wide.
+                        Row(
+                            modifier = Modifier
+                                .width(totalStripWidthDp)
+                                .fillMaxHeight(),
+                        ) {
+                            thumbnails.forEach { bmp ->
+                                Image(
+                                    bitmap = bmp.asImageBitmap(),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.FillBounds,
+                                    modifier = Modifier
+                                        .width(frameWidthDp)
+                                        .fillMaxHeight(),
+                                )
                             }
                         }
 
@@ -559,7 +609,7 @@ fun VideoTrimScreen(
                                     trimStatus = "Trimming ${formatTime(startMs)}–${formatTime(endMs)}…"
                                     val trimSuccess = VideoTrimmer.trim(videoFile, trimmedFile, startMs, endMs)
                                     // v0.7.23 BUG VT-2: check if cancelled after trim
-                                    if (!currentCoroutineContext().isActive) return@withContext
+                                    if (!isActive) return@withContext
                                     val packedFile = if (trimSuccess) trimmedFile else videoFile
                                     trimStatus = if (trimSuccess) "Packing trimmed video…" else "Trim failed — packing full video…"
 
@@ -576,7 +626,7 @@ fun VideoTrimScreen(
                                         outputFile = mpkgFile, previewFile = previewFile,
                                     )
                                     // v0.7.23 BUG VT-2: check if cancelled after pack
-                                    if (!currentCoroutineContext().isActive) return@withContext
+                                    if (!isActive) return@withContext
                                     trimStatus = "Queuing for transfer…"
                                     PairingService.queueWallpaper(mpkgFile, itemTitle)
                                     PairingService.launchWallpaperEngineApp(context)
@@ -598,7 +648,7 @@ fun VideoTrimScreen(
                                 } catch (e: Exception) {
                                     trimStatus = "Failed: ${e.message}"
                                 } finally {
-                                    if (currentCoroutineContext().isActive) {
+                                    if (isActive) {
                                         isTrimming = false
                                         if (success) {
                                             // v0.7.23 BUG VT-4: only call onSendComplete
@@ -641,7 +691,7 @@ fun VideoTrimScreen(
                                         outputFile = mpkgFile, previewFile = previewFile,
                                     )
                                     // v0.7.23 BUG VT-2: check if cancelled after pack
-                                    if (!currentCoroutineContext().isActive) return@withContext
+                                    if (!isActive) return@withContext
                                     trimStatus = "Queuing for transfer…"
                                     PairingService.queueWallpaper(mpkgFile, itemTitle)
                                     PairingService.launchWallpaperEngineApp(context)
@@ -657,7 +707,7 @@ fun VideoTrimScreen(
                                 } catch (e: Exception) {
                                     trimStatus = "Failed: ${e.message}"
                                 } finally {
-                                    if (currentCoroutineContext().isActive) {
+                                    if (isActive) {
                                         isTrimming = false
                                         if (success) {
                                             // v0.7.23 BUG VT-4: only call onSendComplete
@@ -688,3 +738,11 @@ private fun formatTime(ms: Long): String {
     val hr = totalSec / 3600
     return if (hr > 0) "%d:%02d:%02d".format(hr, min, sec) else "%d:%02d".format(min, sec)
 }
+
+/**
+ * v0.7.24: Duration-based filmstrip frame count — one frame per 2 seconds of
+ * video, clamped to [48, 120]. Shared by the thumbnail generator and the strip
+ * layout so the geometry always matches the number of generated frames.
+ */
+private fun frameCountFor(durationMs: Long): Int =
+    if (durationMs <= 0L) 48 else (durationMs / 2000L).toInt().coerceIn(48, 120)

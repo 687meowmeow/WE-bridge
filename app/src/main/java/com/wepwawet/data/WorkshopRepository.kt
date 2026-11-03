@@ -142,7 +142,22 @@ class WorkshopRepository constructor(
 
     // ====== In-memory detail cache (id → typed item) ======
 
-    private val detailCache = java.util.concurrent.ConcurrentHashMap<String, WorkshopItemTyped>()
+    /** v0.7.24 (H-D8): detail-cache LRU bound (≈ 40 browse pages of items). */
+    private val DETAIL_CACHE_MAX_ENTRIES = 1200
+
+    // v0.7.24 (H-D8): was an unbounded ConcurrentHashMap — every browse page
+    // cached ALL its items and every getById miss added another; a long
+    // session browsing thousands of wallpapers grew it without limit.
+    // Bounded access-ordered LRU (synchronized — accessOrder mutation is not
+    // thread-safe even through the Map interface).
+    private val detailCache: MutableMap<String, WorkshopItemTyped> =
+        java.util.Collections.synchronizedMap(
+            object : LinkedHashMap<String, WorkshopItemTyped>(
+                64, 0.75f, /* accessOrder = */ true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, WorkshopItemTyped>): Boolean {
+                    return size > DETAIL_CACHE_MAX_ENTRIES
+                }
+            })
 
     // ====== Creator display names (steamId64 → displayName) ======
 
@@ -907,14 +922,22 @@ class WorkshopRepository constructor(
             // If the cached description is too short, refresh it
             if (it.description.length < 10) {
                 WepWawetLogger.workshop("getById refreshing short description", "id" to id)
-                runCatching {
-                    steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
-                }.onSuccess { fresh ->
+                // v0.7.24 (BUG 26 from v0.7.22 audit): was runCatching — it
+                // catches CancellationException (extends Throwable), so
+                // cancelling the calling coroutine (back-navigation from the
+                // detail screen) was swallowed and converted to a null
+                // return. Explicit try/catch re-throws cancellation.
+                try {
+                    val fresh = steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
                     if (fresh != null && fresh.description.length > it.description.length) {
                         detailCache[id] = fresh
                         resolveCreatorsForItems(listOf(fresh))
                         return fresh
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // refresh failed — fall through to the cached value
                 }
             }
             WepWawetLogger.workshopDebug("getById cache hit", "id" to id)
@@ -924,14 +947,22 @@ class WorkshopRepository constructor(
             // If the browse item's description is too short, fetch full details
             if (it.description.length < 10) {
                 WepWawetLogger.workshop("getById fetching full description for browse item", "id" to id)
-                runCatching {
-                    steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
-                }.onSuccess { fresh ->
+                // v0.7.24 (BUG 26 from v0.7.22 audit): was runCatching — it
+                // catches CancellationException (extends Throwable), so
+                // cancelling the calling coroutine (back-navigation from the
+                // detail screen) was swallowed and converted to a null
+                // return. Explicit try/catch re-throws cancellation.
+                try {
+                    val fresh = steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
                     if (fresh != null && fresh.description.length > it.description.length) {
                         detailCache[id] = fresh
                         resolveCreatorsForItems(listOf(fresh))
                         return fresh
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // refresh failed — fall through to the cached value
                 }
             }
             detailCache[id] = it
@@ -940,33 +971,46 @@ class WorkshopRepository constructor(
         _searchItems.value.firstOrNull { it.id == id }?.let {
             if (it.description.length < 10) {
                 WepWawetLogger.workshop("getById fetching full description for search item", "id" to id)
-                runCatching {
-                    steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
-                }.onSuccess { fresh ->
+                // v0.7.24 (BUG 26 from v0.7.22 audit): was runCatching — it
+                // catches CancellationException (extends Throwable), so
+                // cancelling the calling coroutine (back-navigation from the
+                // detail screen) was swallowed and converted to a null
+                // return. Explicit try/catch re-throws cancellation.
+                try {
+                    val fresh = steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
                     if (fresh != null && fresh.description.length > it.description.length) {
                         detailCache[id] = fresh
                         resolveCreatorsForItems(listOf(fresh))
                         return fresh
                     }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // refresh failed — fall through to the cached value
                 }
             }
             detailCache[id] = it
             return it
         }
         // Fresh fetch
+        // v0.7.24 (BUG 26): was runCatching — see the cached-path fix above;
+        // the same CancellationException swallow applied to this fetch.
         WepWawetLogger.workshop("getById fresh fetch", "id" to id)
-        return runCatching {
-            steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
-        }.onSuccess { typed ->
+        return try {
+            val typed = steamApi.getPublishedFileDetails(listOf(id)).getOrThrow().firstOrNull()
             if (typed != null) {
                 detailCache[id] = typed
                 // Resolve creator name for this item too
                 resolveCreatorsForItems(listOf(typed))
             }
-        }.onFailure { e ->
+            typed
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
             WepWawetLogger.workshopWarn("getById failed",
                 "id" to id, "exception" to e.javaClass.name)
-        }.getOrNull()
+            null
+        }
     }
 
     // ====== Client-side filtering / sorting helpers ======
