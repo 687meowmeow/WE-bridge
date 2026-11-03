@@ -101,7 +101,7 @@ object WorkshopDownloadJob {
 
     /** v0.7.24 (H-D6): remove a completed job's own map entry (no-op if a
      *  newer job already replaced it). Called from launchSafely's finally. */
-    private fun removeJobEntry(itemId: String, job: Job?) {
+    internal fun removeJobEntry(itemId: String, job: Job?) {
         if (job != null) jobs.remove(itemId, job)
     }
 
